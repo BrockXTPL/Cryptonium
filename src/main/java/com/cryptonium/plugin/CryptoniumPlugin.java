@@ -1312,10 +1312,19 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         if (saved != null) {
             String[] parts = saved.split(",");
             try {
-                return new Location(gameWorld,
+                Location loc = new Location(gameWorld,
                         Double.parseDouble(parts[0]) + 0.5,
                         Double.parseDouble(parts[1]),
                         Double.parseDouble(parts[2]) + 0.5);
+                // Only reuse the saved spawn if it still matches the current ring
+                // distance; otherwise regenerate (self-heals after distance tweaks).
+                if (safeCenter == null) return loc;
+                double dx = loc.getX() - safeCenter.getX();
+                double dz = loc.getZ() - safeCenter.getZ();
+                double dist = Math.sqrt(dx * dx + dz * dz);
+                if (dist >= SPAWN_RING_MIN - 10 && dist <= SPAWN_RING_MAX + 10) {
+                    return loc;
+                }
             } catch (Exception ignored) {
             }
         }
