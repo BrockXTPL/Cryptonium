@@ -1293,7 +1293,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     // ---------- Entering the game + personal spawns ----------
 
     private void sendToGame(Player player) {
-        Location spawn = getOrCreateSpawn(player);
+        Location spawn = randomWildsSpawn();
         player.teleport(spawn);
         player.playSound(spawn, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 1f);
         spawn.getWorld().spawnParticle(Particle.PORTAL, spawn.clone().add(0, 1, 0), 40, 0.4, 0.8, 0.4, 0.3);
@@ -1306,28 +1306,8 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                 Title.Times.times(Duration.ofMillis(300), Duration.ofMillis(2200), Duration.ofMillis(600)))), 5L);
     }
 
-    private Location getOrCreateSpawn(Player player) {
-        String key = player.getUniqueId().toString();
-        String saved = spawnsConfig.getString(key);
-        if (saved != null) {
-            String[] parts = saved.split(",");
-            try {
-                Location loc = new Location(gameWorld,
-                        Double.parseDouble(parts[0]) + 0.5,
-                        Double.parseDouble(parts[1]),
-                        Double.parseDouble(parts[2]) + 0.5);
-                // Only reuse the saved spawn if it still matches the current ring
-                // distance; otherwise regenerate (self-heals after distance tweaks).
-                if (safeCenter == null) return loc;
-                double dx = loc.getX() - safeCenter.getX();
-                double dz = loc.getZ() - safeCenter.getZ();
-                double dist = Math.sqrt(dx * dx + dz * dz);
-                if (dist >= SPAWN_RING_MIN - 10 && dist <= SPAWN_RING_MAX + 10) {
-                    return loc;
-                }
-            } catch (Exception ignored) {
-            }
-        }
+    /** A fresh random spot in the spawn ring, different every time. */
+    private Location randomWildsSpawn() {
         int cx = safeCenter != null ? safeCenter.getBlockX() : 0;
         int cz = safeCenter != null ? safeCenter.getBlockZ() : 0;
         int x = cx, z = cz, y = 80;
@@ -1340,8 +1320,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             y = top.getY() + 1;
             if (!top.isLiquid()) break;
         }
-        spawnsConfig.set(key, x + "," + y + "," + z);
-        saveSpawns();
         return new Location(gameWorld, x + 0.5, y, z + 0.5);
     }
 
@@ -1349,8 +1327,8 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     public void onRespawn(PlayerRespawnEvent event) {
         Player player = event.getPlayer();
         if (!event.isBedSpawn() && !event.isAnchorSpawn()) {
-            if (spawnsConfig.contains(player.getUniqueId().toString())) {
-                event.setRespawnLocation(getOrCreateSpawn(player));
+            if (player.getWorld() == gameWorld) {
+                event.setRespawnLocation(randomWildsSpawn());
             } else if (lobbySpawn != null) {
                 event.setRespawnLocation(lobbySpawn);
             }
