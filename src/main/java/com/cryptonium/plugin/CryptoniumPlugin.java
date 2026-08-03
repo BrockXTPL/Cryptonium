@@ -3,6 +3,7 @@ package com.cryptonium.plugin;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
+import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
@@ -30,17 +31,18 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Cryptonium - Step 2.
+ * Cryptonium - Step 2 (+ admin command).
  *
- * Step 1 gave us the Cryptonium item. Step 2 makes it MINEABLE:
+ * Mining:
  *   - Adds a "Cryptonium Ore" block (a purple crystal block) you can place.
  *   - When you break one of OUR ore blocks, it drops Cryptonium instead of itself.
  *   - Only ore we placed counts, so normal blocks are unaffected.
- *   - The list of ore locations is saved to a file, so it survives restarts.
+ *   - Ore locations are saved to a file, so they survive restarts.
  *
  * Commands:
  *   /cryptonium give [amount]  -> get Cryptonium items
  *   /cryptonium ore  [amount]  -> get Cryptonium Ore blocks to place and mine
+ *   /cnadmin <password>        -> toggle Creative mode (password protected)
  */
 public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
@@ -49,6 +51,9 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     // How much Cryptonium one ore block drops when mined.
     private static final int DROP_PER_ORE = 1;
+
+    // Password for the admin creative toggle. Convenience only - not real security.
+    private static final String ADMIN_PASSWORD = "5886";
 
     private NamespacedKey cryptoniumKey;   // stamps the Cryptonium item
     private NamespacedKey oreItemKey;      // stamps the placeable ore item
@@ -64,7 +69,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         oreItemKey = new NamespacedKey(this, "cryptonium_ore");
         getServer().getPluginManager().registerEvents(this, this);
         loadOres();
-        getLogger().info("Cryptonium is enabled. /cryptonium give  and  /cryptonium ore  are ready.");
+        getLogger().info("Cryptonium is enabled. /cryptonium give, /cryptonium ore, /cnadmin are ready.");
     }
 
     @Override
@@ -188,35 +193,65 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         event.getPlayer().sendMessage(plain("Welcome! Mine Cryptonium, bank it, cash it out.", NamedTextColor.AQUA));
     }
 
+    // ---------- Commands ----------
+
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (!command.getName().equalsIgnoreCase("cryptonium")) return false;
-
         if (!(sender instanceof Player player)) {
             sender.sendMessage("Only players can use this command.");
             return true;
         }
 
-        if (args.length >= 1 && args[0].equalsIgnoreCase("give")) {
-            int amount = parseAmount(player, args);
-            if (amount < 0) return true;
-            player.getInventory().addItem(makeCryptonium(amount));
-            player.sendMessage(plain("You received " + clamp(amount) + " Cryptonium.", NamedTextColor.GREEN));
+        String cmd = command.getName().toLowerCase();
+
+        if (cmd.equals("cnadmin")) {
+            handleAdmin(player, args);
             return true;
         }
 
-        if (args.length >= 1 && args[0].equalsIgnoreCase("ore")) {
-            int amount = parseAmount(player, args);
-            if (amount < 0) return true;
-            player.getInventory().addItem(makeCryptoniumOre(amount));
-            player.sendMessage(plain("You received " + clamp(amount) + " Cryptonium Ore. Place it and mine it!",
-                    NamedTextColor.GREEN));
+        if (cmd.equals("cryptonium")) {
+            if (args.length >= 1 && args[0].equalsIgnoreCase("give")) {
+                int amount = parseAmount(player, args);
+                if (amount < 0) return true;
+                player.getInventory().addItem(makeCryptonium(amount));
+                player.sendMessage(plain("You received " + clamp(amount) + " Cryptonium.", NamedTextColor.GREEN));
+                return true;
+            }
+
+            if (args.length >= 1 && args[0].equalsIgnoreCase("ore")) {
+                int amount = parseAmount(player, args);
+                if (amount < 0) return true;
+                player.getInventory().addItem(makeCryptoniumOre(amount));
+                player.sendMessage(plain("You received " + clamp(amount) + " Cryptonium Ore. Place it and mine it!",
+                        NamedTextColor.GREEN));
+                return true;
+            }
+
+            player.sendMessage(plain("Cryptonium is running. Try: /cryptonium give 5  or  /cryptonium ore 5",
+                    NamedTextColor.AQUA));
             return true;
         }
 
-        player.sendMessage(plain("Cryptonium is running. Try: /cryptonium give 5  or  /cryptonium ore 5",
-                NamedTextColor.AQUA));
-        return true;
+        return false;
+    }
+
+    /** Password-protected toggle between Creative and Survival. */
+    private void handleAdmin(Player player, String[] args) {
+        if (args.length < 1) {
+            player.sendMessage(plain("Usage: /cnadmin <password>", NamedTextColor.RED));
+            return;
+        }
+        if (!args[0].equals(ADMIN_PASSWORD)) {
+            player.sendMessage(plain("Wrong password.", NamedTextColor.RED));
+            return;
+        }
+        if (player.getGameMode() == GameMode.CREATIVE) {
+            player.setGameMode(GameMode.SURVIVAL);
+            player.sendMessage(plain("Admin mode OFF - back to Survival.", NamedTextColor.YELLOW));
+        } else {
+            player.setGameMode(GameMode.CREATIVE);
+            player.sendMessage(plain("Admin mode ON - Creative enabled.", NamedTextColor.GREEN));
+        }
     }
 
     /** Reads the amount argument, or returns 1 if none. Returns -1 if it was invalid (and warns the player). */
