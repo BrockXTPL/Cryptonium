@@ -1,14 +1,17 @@
 name: Cryptonium
-version: 0.1.0
+version: 0.2.0
 main: com.cryptonium.plugin.CryptoniumPlugin
 api-version: '1.21'
 author: TheJewer
 description: The Cryptonium play-to-earn resource system.
 commands:
   cryptonium:
-    description: Get Cryptonium, get ore, check the plugin.
-    usage: "/cryptonium give [amount] | /cryptonium ore [amount]"
+    description: Cryptonium items, ore, and vault chest.
+    usage: "/cryptonium give [amount] | ore [amount] | chest"
     aliases: [cn]
   cnadmin:
-    description: Password-protected Creative-mode toggle.
-    usage: "/cnadmin <password>"
+    description: Password-protected admin tools.
+    usage: "/cnadmin <password> [banker|enter]"
+  wallet:
+    description: Save your Solana payout wallet.
+    usage: "/wallet set <address> | /wallet | /wallet clear"
