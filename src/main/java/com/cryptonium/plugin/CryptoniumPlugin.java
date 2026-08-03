@@ -2105,12 +2105,22 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             String sub = args.length >= 1 ? args[0].toLowerCase() : "";
             switch (sub) {
                 case "give" -> {
+                    if (!player.isOp()) {
+                        player.sendMessage(plain("Only server operators can spawn Cryptonium.", NamedTextColor.RED));
+                        getLogger().warning("[SECURITY] " + player.getName() + " tried /cryptonium give without op.");
+                        return true;
+                    }
                     int amount = parseAmount(player, args);
                     if (amount < 0) return true;
                     giveOrDrop(player, makeCryptonium(amount));
                     player.sendMessage(plain("You received " + clamp(amount) + " Cryptonium.", NamedTextColor.GREEN));
                 }
                 case "ore" -> {
+                    if (!player.isOp()) {
+                        player.sendMessage(plain("Only server operators can spawn Cryptonium Ore.", NamedTextColor.RED));
+                        getLogger().warning("[SECURITY] " + player.getName() + " tried /cryptonium ore without op.");
+                        return true;
+                    }
                     int amount = parseAmount(player, args);
                     if (amount < 0) return true;
                     giveOrDrop(player, makeCryptoniumOre(amount));
@@ -2179,13 +2189,32 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         player.sendMessage(plain("Usage: /wallet set <address> | /wallet | /wallet clear", NamedTextColor.RED));
     }
 
+    private final Map<UUID, Long> adminLockout = new HashMap<>();
+
     private void handleAdmin(Player player, String[] args) {
+        // Only server operators may even attempt this command. To everyone
+        // else it looks like the command doesn't exist. Attempts are logged.
+        if (!player.isOp()) {
+            player.sendMessage(plain("Unknown command. Type \"/help\" for help.", NamedTextColor.WHITE));
+            getLogger().warning("[SECURITY] " + player.getName()
+                    + " tried /cnadmin without operator status.");
+            return;
+        }
+        long now = System.currentTimeMillis();
+        Long lockedUntil = adminLockout.get(player.getUniqueId());
+        if (lockedUntil != null && now < lockedUntil) {
+            player.sendMessage(plain("Too many wrong attempts - wait "
+                    + ((lockedUntil - now) / 1000L + 1) + "s.", NamedTextColor.RED));
+            return;
+        }
         if (args.length < 1) {
             player.sendMessage(plain("Usage: /cnadmin <password> [banker|enter|shop]", NamedTextColor.RED));
             return;
         }
         if (!args[0].equals(ADMIN_PASSWORD)) {
-            player.sendMessage(plain("Wrong password.", NamedTextColor.RED));
+            adminLockout.put(player.getUniqueId(), now + 60_000L);
+            player.sendMessage(plain("Wrong password. Locked for 60 seconds.", NamedTextColor.RED));
+            getLogger().warning("[SECURITY] " + player.getName() + " entered a wrong /cnadmin password.");
             return;
         }
         if (args.length >= 2) {
