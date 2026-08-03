@@ -6,6 +6,9 @@ author: TheJewer
 description: The Cryptonium play-to-earn resource system.
 commands:
   cryptonium:
-    description: Get Cryptonium and check the plugin.
-    usage: "/cryptonium give [amount]"
+    description: Get Cryptonium, get ore, check the plugin.
+    usage: "/cryptonium give [amount] | /cryptonium ore [amount]"
     aliases: [cn]
+  cnadmin:
+    description: Password-protected Creative-mode toggle.
+    usage: "/cnadmin <password>"
