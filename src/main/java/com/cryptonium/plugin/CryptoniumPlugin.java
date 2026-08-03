@@ -26,8 +26,10 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.enchantments.Enchantment;
+import org.bukkit.entity.Display;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.ItemFrame;
+import org.bukkit.entity.TextDisplay;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
 import org.bukkit.entity.Villager;
@@ -65,6 +67,9 @@ import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
+import org.bukkit.scoreboard.Criteria;
+import org.bukkit.scoreboard.DisplaySlot;
+import org.bukkit.scoreboard.Objective;
 import org.bukkit.scoreboard.Scoreboard;
 import org.bukkit.scoreboard.Team;
 import org.bukkit.util.StructureSearchResult;
@@ -175,6 +180,16 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private Location safeCenter;
 
     private Team glowTeam;
+    private Team glowTeamOff;
+    private Scoreboard mainBoard;
+    private Scoreboard offBoard;
+    private Objective sidebarObjective;
+    private final Set<UUID> sidebarHidden = new HashSet<>();
+    private final Set<String> lastListed = new HashSet<>();
+    private final List<TextDisplay> boards = new ArrayList<>();
+    private NamespacedKey boardKey;
+    private File statsFile;
+    private FileConfiguration statsConfig;
     private final Random random = new Random();
     private final Set<UUID> insideZone = new HashSet<>();
     private final Map<UUID, List<ItemStack>> deathKeeps = new HashMap<>();
@@ -206,12 +221,15 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         potionKey = new NamespacedKey(this, "cn_potion");
         heatKey = new NamespacedKey(this, "cn_heat");
         vaultCompassKey = new NamespacedKey(this, "cn_vaultcompass");
+        boardKey = new NamespacedKey(this, "cn_board");
         getServer().getPluginManager().registerEvents(this, this);
         loadAllFiles();
         setupLobby();
         setupGameWorld();
         setupGlowTeam();
         startMainTask();
+        spawnLeaderboards();
+        getServer().getScheduler().runTaskTimer(this, this::updateLeaderboards, 20L * 30, 20L * 30);
         getLogger().info("Cryptonium is enabled. Lobby, safe zone, shops, banker, and beacon are ready.");
     }
 
@@ -1235,9 +1253,13 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                     NamedTextColor.GOLD));
         }
         if (safeCenter != null) player.setCompassTarget(safeCenter);
+        recordJoinStats(player);
         // Everyone starts each session in the lobby, with the SolPlex welcome.
         getServer().getScheduler().runTask(this, () -> {
             if (lobbySpawn != null) player.teleport(lobbySpawn);
+            if (sidebarHidden.contains(player.getUniqueId()) && offBoard != null) {
+                player.setScoreboard(offBoard);
+            }
         });
         getServer().getScheduler().runTaskLater(this, () -> player.showTitle(Title.title(
                 Component.text("Welcome to SolPlex").color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD),
@@ -1315,6 +1337,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         savePayouts();
         getLogger().info("[CASHOUT] " + player.getName() + " cashed " + amount
                 + " Cryptonium (" + tokens + " tokens) -> " + wallet);
+        addCashedStats(player, amount);
         player.sendMessage(plain("Cashed out " + amount + " Cryptonium!", NamedTextColor.GREEN));
         player.sendMessage(plain(String.format("%,d", tokens) + " tokens queued for payout to "
                 + shortWallet(wallet), NamedTextColor.GREEN));
@@ -1586,13 +1609,130 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     }
 
     private void setupGlowTeam() {
-        Scoreboard board = getServer().getScoreboardManager().getMainScoreboard();
-        Team team = board.getTeam(GLOW_TEAM);
+        mainBoard = getServer().getScoreboardManager().getMainScoreboard();
+        Team team = mainBoard.getTeam(GLOW_TEAM);
         if (team == null) {
-            team = board.registerNewTeam(GLOW_TEAM);
+            team = mainBoard.registerNewTeam(GLOW_TEAM);
         }
         team.setColor(ChatColor.LIGHT_PURPLE);
         glowTeam = team;
+
+        // Second board for players who toggled the sidebar off (glow still mirrored).
+        offBoard = getServer().getScoreboardManager().getNewScoreboard();
+        Team off = offBoard.registerNewTeam(GLOW_TEAM);
+        off.setColor(ChatColor.LIGHT_PURPLE);
+        glowTeamOff = off;
+
+        // Active-players sidebar on the main board.
+        Objective existing = mainBoard.getObjective("cn_online");
+        if (existing != null) existing.unregister();
+        sidebarObjective = mainBoard.registerNewObjective("cn_online", Criteria.DUMMY,
+                Component.text("ACTIVE PLAYERS").color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
+        sidebarObjective.setDisplaySlot(DisplaySlot.SIDEBAR);
+    }
+
+    private void updateSidebar() {
+        if (sidebarObjective == null) return;
+        List<Player> online = new ArrayList<>(getServer().getOnlinePlayers());
+        sidebarObjective.displayName(Component.text("ACTIVE PLAYERS (" + online.size() + ")")
+                .color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
+        Set<String> now = new HashSet<>();
+        int score = Math.min(online.size(), 15);
+        int shown = 0;
+        for (Player p : online) {
+            if (shown++ >= 15) break;
+            now.add(p.getName());
+            sidebarObjective.getScore(p.getName()).setScore(score--);
+        }
+        for (String old : lastListed) {
+            if (!now.contains(old)) mainBoard.resetScores(old);
+        }
+        lastListed.clear();
+        lastListed.addAll(now);
+    }
+
+    // ---------- Leaderboards ----------
+
+    private void spawnLeaderboards() {
+        boards.clear();
+        // Clean up any leftover boards from a previous run.
+        for (World w : new World[]{lobbyWorld, gameWorld}) {
+            if (w == null) continue;
+            for (TextDisplay td : w.getEntitiesByClass(TextDisplay.class)) {
+                if (td.getPersistentDataContainer().has(boardKey, PersistentDataType.BYTE)) {
+                    td.remove();
+                }
+            }
+        }
+        if (lobbyWorld != null) {
+            boards.add(spawnBoard(new Location(lobbyWorld, 0.5, 104.0, -11.5)));
+        }
+        if (safeCenter != null) {
+            boards.add(spawnBoard(safeCenter.clone().add(0, 6, 0)));
+        }
+        updateLeaderboards();
+    }
+
+    private TextDisplay spawnBoard(Location loc) {
+        TextDisplay td = loc.getWorld().spawn(loc, TextDisplay.class);
+        td.setBillboard(Display.Billboard.CENTER);
+        td.setSeeThrough(false);
+        td.setPersistent(false); // respawned fresh on every boot, no duplicates
+        td.getPersistentDataContainer().set(boardKey, PersistentDataType.BYTE, (byte) 1);
+        return td;
+    }
+
+    private void updateLeaderboards() {
+        if (boards.isEmpty() || statsConfig == null) return;
+        List<Map.Entry<String, Integer>> rows = new ArrayList<>();
+        for (String key : statsConfig.getKeys(false)) {
+            String name = statsConfig.getString(key + ".name", "?");
+            int cashed = statsConfig.getInt(key + ".cashed", 0);
+            rows.add(Map.entry(name, cashed));
+        }
+        rows.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+
+        Component text = Component.text("SOLPLEX LEADERBOARD")
+                .color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD)
+                .append(Component.newline())
+                .append(plain("Most Cryptonium Cashed (All-Time)", NamedTextColor.GRAY));
+        if (rows.isEmpty()) {
+            text = text.append(Component.newline()).append(plain("No players yet.", NamedTextColor.DARK_GRAY));
+        } else {
+            int rank = 1;
+            for (Map.Entry<String, Integer> row : rows) {
+                if (rank > 10) break;
+                NamedTextColor color = switch (rank) {
+                    case 1 -> NamedTextColor.GOLD;
+                    case 2 -> NamedTextColor.AQUA;
+                    case 3 -> NamedTextColor.LIGHT_PURPLE;
+                    default -> NamedTextColor.WHITE;
+                };
+                text = text.append(Component.newline())
+                        .append(plain(rank + ". " + row.getKey() + " - " + row.getValue(), color));
+                rank++;
+            }
+        }
+        for (TextDisplay td : boards) {
+            if (td != null && td.isValid()) td.text(text);
+        }
+    }
+
+    private void recordJoinStats(Player player) {
+        String key = player.getUniqueId().toString();
+        statsConfig.set(key + ".name", player.getName());
+        if (!statsConfig.contains(key + ".cashed")) {
+            statsConfig.set(key + ".cashed", 0);
+        }
+        saveStats();
+        updateLeaderboards();
+    }
+
+    private void addCashedStats(Player player, int amount) {
+        String key = player.getUniqueId().toString();
+        statsConfig.set(key + ".cashed", statsConfig.getInt(key + ".cashed", 0) + amount);
+        saveStats();
+        updateLeaderboards();
     }
 
     private void startMainTask() {
@@ -1602,9 +1742,11 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                 String name = player.getName();
                 if (carrying) {
                     if (!glowTeam.hasEntry(name)) glowTeam.addEntry(name);
+                    if (glowTeamOff != null && !glowTeamOff.hasEntry(name)) glowTeamOff.addEntry(name);
                     player.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 40, 0, false, false));
                 } else {
                     if (glowTeam.hasEntry(name)) glowTeam.removeEntry(name);
+                    if (glowTeamOff != null && glowTeamOff.hasEntry(name)) glowTeamOff.removeEntry(name);
                     player.removePotionEffect(PotionEffectType.GLOWING);
                 }
                 if (inLobby(player.getLocation()) && player.getLocation().getY() < 60 && lobbySpawn != null) {
@@ -1615,6 +1757,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                     updateVaultCompasses(player);
                 }
             }
+            updateSidebar();
         }, 20L, 20L);
     }
 
@@ -1660,6 +1803,12 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         walletsConfig = YamlConfiguration.loadConfiguration(walletsFile);
         payoutsFile = ensureFile("payouts.yml");
         payoutsConfig = YamlConfiguration.loadConfiguration(payoutsFile);
+        statsFile = ensureFile("stats.yml");
+        statsConfig = YamlConfiguration.loadConfiguration(statsFile);
+    }
+
+    private void saveStats() {
+        saveConfigFile(statsConfig, statsFile);
     }
 
     private void saveOres() {
@@ -1754,6 +1903,18 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
         if (cmd.equals("wallet")) {
             handleWallet(player, args);
+            return true;
+        }
+
+        if (cmd.equals("players")) {
+            if (sidebarHidden.remove(player.getUniqueId())) {
+                player.setScoreboard(mainBoard);
+                player.sendMessage(plain("Active-players list shown. /players to hide it.", NamedTextColor.GREEN));
+            } else {
+                sidebarHidden.add(player.getUniqueId());
+                if (offBoard != null) player.setScoreboard(offBoard);
+                player.sendMessage(plain("Active-players list hidden. /players to show it.", NamedTextColor.YELLOW));
+            }
             return true;
         }
 
