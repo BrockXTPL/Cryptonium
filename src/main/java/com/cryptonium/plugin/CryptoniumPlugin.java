@@ -111,8 +111,8 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private static final long VAULT_PICKUP_LOCK_MS = 10L * 60L * 1000L; // 10 minutes
     private static final String LOBBY_WORLD_NAME = "cn_lobby";
     private static final double SAFE_ZONE_RADIUS = 80.0;
-    private static final int SPAWN_RING_MIN = 250;
-    private static final int SPAWN_RING_MAX = 450;
+    private static final int SPAWN_RING_MIN = 85;
+    private static final int SPAWN_RING_MAX = 115;
     private static final int VILLAGE_SEARCH_RADIUS_CHUNKS = 64;
     private static final long TOKENS_PER_CRYPTONIUM = 150_000L;
     private static final String B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
