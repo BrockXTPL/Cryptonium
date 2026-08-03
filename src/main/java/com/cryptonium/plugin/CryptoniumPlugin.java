@@ -24,8 +24,10 @@ import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.entity.VillagerAcquireTradeEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.world.LootGenerateEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -47,21 +49,14 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Cryptonium - item, mining, risk, and the personal-vault chest.
+ * Cryptonium - Cryptonium replaces diamonds across the world.
  *
- * Mining:
- *   - Placeable "Cryptonium Ore" block; needs an iron+ pickaxe; drops into your pack.
+ * Diamonds -> Cryptonium:
+ *   - Mining natural diamond ore (regular/deepslate) drops Cryptonium (iron+ pickaxe).
+ *   - Diamonds in generated loot (chests, etc.) are swapped for Cryptonium.
+ *   - Villager trades that would give raw diamonds are blocked.
  *
- * Risk + visibility:
- *   - Carried Cryptonium drops on death (announced). Carriers glow purple.
- *   - Picking Cryptonium off the ground announces how much.
- *
- * Personal Vault chest:
- *   - Given on first join (or /cryptonium chest). Stamped with your identity.
- *   - Once placed it's YOUR vault: only you can open it; nobody else can break it;
- *     explosions can't destroy it.
- *   - 5-second lock after placing before you can pick it back up (anti insta-bank).
- *   - When you break it, contents + the chest return to you (nobody else can grab it).
+ * Mining, risk, vault, glow, alerts as before.
  *
  * Commands:
  *   /cryptonium give [amount] | ore [amount] | chest
@@ -83,7 +78,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private File oreFile;
     private FileConfiguration oreConfig;
 
-    // Placed vault chests: location -> owner. Plus when each was placed (in-memory).
     private final Map<String, UUID> chestOwners = new HashMap<>();
     private final Map<String, Long> chestPlaceTime = new HashMap<>();
     private final Set<UUID> receivedStarterChest = new HashSet<>();
@@ -102,7 +96,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         loadVaults();
         setupGlowTeam();
         startGlowTask();
-        getLogger().info("Cryptonium is enabled. Mining, vault chests, glow, and alerts are ready.");
+        getLogger().info("Cryptonium is enabled. Diamonds now yield Cryptonium.");
     }
 
     @Override
@@ -135,7 +129,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         return tag != null && tag == (byte) 1;
     }
 
-    // ---------- Cryptonium ore ----------
+    // ---------- Cryptonium ore (placeable) ----------
 
     public ItemStack makeCryptoniumOre(int amount) {
         ItemStack item = new ItemStack(ORE_MATERIAL, clamp(amount));
@@ -186,6 +180,36 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    // ---------- Diamonds -> Cryptonium ----------
+
+    private boolean isDiamondOre(Material m) {
+        return m == Material.DIAMOND_ORE || m == Material.DEEPSLATE_DIAMOND_ORE;
+    }
+
+    /** Loot in generated containers: replace diamonds with Cryptonium. */
+    @EventHandler
+    public void onLootGenerate(LootGenerateEvent event) {
+        List<ItemStack> newLoot = new ArrayList<>();
+        boolean changed = false;
+        for (ItemStack it : event.getLoot()) {
+            if (it != null && it.getType() == Material.DIAMOND) {
+                newLoot.add(makeCryptonium(it.getAmount()));
+                changed = true;
+            } else {
+                newLoot.add(it);
+            }
+        }
+        if (changed) event.setLoot(newLoot);
+    }
+
+    /** Never let a villager trade hand out raw diamonds. */
+    @EventHandler
+    public void onVillagerTrade(VillagerAcquireTradeEvent event) {
+        if (event.getRecipe().getResult().getType() == Material.DIAMOND) {
+            event.setCancelled(true);
+        }
+    }
+
     // ---------- Mining ----------
 
     @EventHandler
@@ -221,8 +245,9 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             return;
         }
 
-        // Cryptonium ore.
-        if (!oreLocations.contains(key)) return;
+        boolean trackedOre = oreLocations.contains(key);
+        boolean naturalDiamond = isDiamondOre(block.getType());
+        if (!trackedOre && !naturalDiamond) return;
 
         Material tool = player.getInventory().getItemInMainHand().getType();
         if (!isAllowedPickaxe(tool)) {
@@ -231,8 +256,10 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             return;
         }
 
-        oreLocations.remove(key);
-        saveOres();
+        if (trackedOre) {
+            oreLocations.remove(key);
+            saveOres();
+        }
         event.setDropItems(false);
         giveOrDrop(player, makeCryptonium(DROP_PER_ORE));
         player.sendMessage(plain("You mined Cryptonium!", NamedTextColor.AQUA));
@@ -265,7 +292,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             return;
         }
 
-        // Owner is allowed to pick it up: return contents + the chest, drop nothing on the ground.
         if (block.getState() instanceof Chest chestState) {
             Inventory inv = chestState.getBlockInventory();
             for (ItemStack it : inv.getContents()) {
@@ -288,7 +314,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         if (block == null) return;
         String key = locKey(block);
         UUID owner = chestOwners.get(key);
-        if (owner == null) return; // not a vault
+        if (owner == null) return;
         if (!event.getPlayer().getUniqueId().equals(owner)) {
             event.setCancelled(true);
             event.getPlayer().sendMessage(plain("This is not your vault.", NamedTextColor.RED));
