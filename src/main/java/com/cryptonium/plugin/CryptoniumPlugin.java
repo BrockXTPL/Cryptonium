@@ -338,7 +338,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     public ItemStack makeVillageCompass() {
         ItemStack item = new ItemStack(Material.COMPASS, 1);
         CompassMeta meta = (CompassMeta) item.getItemMeta();
-        meta.displayName(plain("Village Compass", NamedTextColor.GOLD));
+        meta.displayName(plain("◆ Village Compass", NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
         meta.lore(List.of(
                 plain("Points to the central village", NamedTextColor.GRAY),
                 plain("(the safe cash-out zone).", NamedTextColor.GRAY),
@@ -458,7 +458,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     public ItemStack makeHeatSeeker() {
         ItemStack item = new ItemStack(Material.COMPASS);
         CompassMeta meta = (CompassMeta) item.getItemMeta();
-        applyShopMeta(meta, "Heat Seeker", NamedTextColor.RED,
+        applyShopMeta(meta, "◆ Heat Seeker", NamedTextColor.RED,
                 List.of("Points to the nearest player",
                         "carrying Cryptonium.",
                         "Updates every second."), PRICE_HEATSEEKER);
@@ -575,7 +575,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     public ItemStack makeVaultCompass() {
         ItemStack item = new ItemStack(Material.COMPASS);
         CompassMeta meta = (CompassMeta) item.getItemMeta();
-        meta.displayName(plain("Vault Compass", NamedTextColor.LIGHT_PURPLE));
+        meta.displayName(plain("◆ Vault Compass", NamedTextColor.LIGHT_PURPLE).decorate(TextDecoration.BOLD));
         meta.lore(List.of(
                 plain("Points to your placed vault chest.", NamedTextColor.GRAY),
                 plain("Soulbound - stays with you on death.", NamedTextColor.LIGHT_PURPLE)
