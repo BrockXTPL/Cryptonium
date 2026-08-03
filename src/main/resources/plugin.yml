@@ -1,0 +1,11 @@
+name: Cryptonium
+version: 0.1.0
+main: com.cryptonium.plugin.CryptoniumPlugin
+api-version: '1.21'
+author: TheJewer
+description: The Cryptonium play-to-earn resource system.
+commands:
+  cryptonium:
+    description: Get Cryptonium and check the plugin.
+    usage: "/cryptonium give [amount]"
+    aliases: [cn]
