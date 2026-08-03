@@ -124,8 +124,8 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private static final long POTION_COOLDOWN_MS = 5L * 60L * 1000L;    // 5 minutes
     private static final String LOBBY_WORLD_NAME = "cn_lobby";
     private static final double SAFE_ZONE_RADIUS = 80.0;
-    private static final int SPAWN_RING_MIN = 85;
-    private static final int SPAWN_RING_MAX = 115;
+    private static final int SPAWN_RING_MIN = 42;
+    private static final int SPAWN_RING_MAX = 58;
     private static final int VILLAGE_SEARCH_RADIUS_CHUNKS = 64;
     private static final long TOKENS_PER_CRYPTONIUM = 150_000L;
     private static final String B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -138,6 +138,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private static final int PRICE_LEGGINGS = 30;
     private static final int PRICE_BOOTS = 20;
     private static final int PRICE_POTION = 60;
+    private static final int PRICE_HEATSEEKER = 25;
 
     private NamespacedKey cryptoniumKey;
     private NamespacedKey oreItemKey;
@@ -147,6 +148,8 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private NamespacedKey soulboundKey;
     private NamespacedKey luckyKey;
     private NamespacedKey potionKey;
+    private NamespacedKey heatKey;
+    private NamespacedKey vaultCompassKey;
 
     private final Set<String> oreLocations = new HashSet<>();
     private File oreFile;
@@ -201,6 +204,8 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         soulboundKey = new NamespacedKey(this, "cn_soulbound");
         luckyKey = new NamespacedKey(this, "cn_lucky");
         potionKey = new NamespacedKey(this, "cn_potion");
+        heatKey = new NamespacedKey(this, "cn_heat");
+        vaultCompassKey = new NamespacedKey(this, "cn_vaultcompass");
         getServer().getPluginManager().registerEvents(this, this);
         loadAllFiles();
         setupLobby();
@@ -416,6 +421,190 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         return tag != null && tag == (byte) 1;
     }
 
+    public ItemStack makeHeatSeeker() {
+        ItemStack item = new ItemStack(Material.COMPASS);
+        CompassMeta meta = (CompassMeta) item.getItemMeta();
+        applyShopMeta(meta, "Heat Seeker", NamedTextColor.RED,
+                List.of("Points to the nearest player",
+                        "carrying Cryptonium.",
+                        "Updates every second."), PRICE_HEATSEEKER);
+        if (safeCenter != null) {
+            meta.setLodestone(safeCenter);
+            meta.setLodestoneTracked(false);
+        }
+        meta.getPersistentDataContainer().set(heatKey, PersistentDataType.BYTE, (byte) 1);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private boolean isHeatSeeker(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        Byte tag = item.getItemMeta().getPersistentDataContainer()
+                .get(heatKey, PersistentDataType.BYTE);
+        return tag != null && tag == (byte) 1;
+    }
+
+    public ItemStack makeVaultCompass() {
+        ItemStack item = new ItemStack(Material.COMPASS);
+        CompassMeta meta = (CompassMeta) item.getItemMeta();
+        meta.displayName(plain("Vault Compass", NamedTextColor.LIGHT_PURPLE));
+        meta.lore(List.of(
+                plain("Points to your placed vault chest.", NamedTextColor.GRAY),
+                plain("Soulbound - stays with you on death.", NamedTextColor.LIGHT_PURPLE)
+        ));
+        if (safeCenter != null) {
+            meta.setLodestone(safeCenter);
+            meta.setLodestoneTracked(false);
+        }
+        meta.setEnchantmentGlintOverride(true);
+        meta.getPersistentDataContainer().set(vaultCompassKey, PersistentDataType.BYTE, (byte) 1);
+        meta.getPersistentDataContainer().set(soulboundKey, PersistentDataType.BYTE, (byte) 1);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private boolean isVaultCompass(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        Byte tag = item.getItemMeta().getPersistentDataContainer()
+                .get(vaultCompassKey, PersistentDataType.BYTE);
+        return tag != null && tag == (byte) 1;
+    }
+
+    private boolean hasVaultCompass(Player player) {
+        for (ItemStack it : player.getInventory().getContents()) {
+            if (isVaultCompass(it)) return true;
+        }
+        return false;
+    }
+
+    /** The location of this player's placed vault nearest to them, or null if none placed. */
+    private Location findOwnVault(Player player) {
+        Location best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (Map.Entry<String, UUID> e : chestOwners.entrySet()) {
+            if (!e.getValue().equals(player.getUniqueId())) continue;
+            String[] parts = e.getKey().split(",");
+            if (parts.length < 4) continue;
+            World w = getServer().getWorld(parts[0]);
+            if (w == null || w != player.getWorld()) continue;
+            try {
+                Location loc = new Location(w, Integer.parseInt(parts[1]) + 0.5,
+                        Integer.parseInt(parts[2]), Integer.parseInt(parts[3]) + 0.5);
+                double d = loc.distanceSquared(player.getLocation());
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = loc;
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return best;
+    }
+
+    /** Re-aims the player's Vault Compasses at their placed vault (or the village if none). */
+    private void updateVaultCompasses(Player player) {
+        boolean hasCompass = false;
+        for (ItemStack it : player.getInventory().getContents()) {
+            if (isVaultCompass(it)) {
+                hasCompass = true;
+                break;
+            }
+        }
+        if (!hasCompass) return;
+
+        Location vault = findOwnVault(player);
+        Location aim = vault != null ? vault : safeCenter;
+        if (aim == null) return;
+        for (ItemStack it : player.getInventory().getContents()) {
+            if (!isVaultCompass(it)) continue;
+            CompassMeta cm = (CompassMeta) it.getItemMeta();
+            cm.setLodestone(aim);
+            cm.setLodestoneTracked(false);
+            it.setItemMeta(cm);
+        }
+
+        if (isVaultCompass(player.getInventory().getItemInMainHand())) {
+            if (vault != null) {
+                int dist = (int) player.getLocation().distance(vault);
+                player.sendActionBar(plain("Vault: " + dist + "m", NamedTextColor.LIGHT_PURPLE));
+            } else {
+                player.sendActionBar(plain("No vault placed - it points to the village.", NamedTextColor.GRAY));
+            }
+        }
+    }
+
+    /** Re-aims every Heat Seeker in this player's inventory at the nearest carrier. */
+    private void updateHeatSeekers(Player player) {
+        boolean hasSeeker = false;
+        for (ItemStack it : player.getInventory().getContents()) {
+            if (isHeatSeeker(it)) {
+                hasSeeker = true;
+                break;
+            }
+        }
+        if (!hasSeeker) return;
+
+        Player target = null;
+        double best = Double.MAX_VALUE;
+        for (Player q : getServer().getOnlinePlayers()) {
+            if (q == player || q.getWorld() != gameWorld || q.isDead()) continue;
+            if (countCarried(q) <= 0) continue;
+            double d = q.getLocation().distanceSquared(player.getLocation());
+            if (d < best) {
+                best = d;
+                target = q;
+            }
+        }
+
+        Location aim = target != null ? target.getLocation() : safeCenter;
+        if (aim == null) return;
+        ItemStack[] contents = player.getInventory().getContents();
+        for (ItemStack it : contents) {
+            if (!isHeatSeeker(it)) continue;
+            CompassMeta cm = (CompassMeta) it.getItemMeta();
+            cm.setLodestone(aim);
+            cm.setLodestoneTracked(false);
+            it.setItemMeta(cm);
+        }
+
+        if (isHeatSeeker(player.getInventory().getItemInMainHand())) {
+            if (target != null) {
+                int dist = (int) Math.sqrt(best);
+                player.sendActionBar(plain("Heat Seeker: " + target.getName() + " - " + dist + "m",
+                        NamedTextColor.RED));
+            } else {
+                player.sendActionBar(plain("Heat Seeker: no carriers detected", NamedTextColor.GRAY));
+            }
+        }
+    }
+
+    @EventHandler
+    public void onHeatSeekerUse(PlayerInteractEvent event) {
+        if (event.getAction() != Action.RIGHT_CLICK_AIR
+                && event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        ItemStack item = event.getItem();
+        if (!isHeatSeeker(item)) return;
+        Player player = event.getPlayer();
+        Player target = null;
+        double best = Double.MAX_VALUE;
+        for (Player q : getServer().getOnlinePlayers()) {
+            if (q == player || q.getWorld() != gameWorld || q.isDead()) continue;
+            if (countCarried(q) <= 0) continue;
+            double d = q.getLocation().distanceSquared(player.getLocation());
+            if (d < best) {
+                best = d;
+                target = q;
+            }
+        }
+        if (target != null) {
+            player.sendMessage(plain("Heat Seeker: tracking " + target.getName() + " ("
+                    + (int) Math.sqrt(best) + " blocks away).", NamedTextColor.RED));
+        } else {
+            player.sendMessage(plain("Heat Seeker: no Cryptonium carriers detected right now.",
+                    NamedTextColor.GRAY));
+        }
+    }
+
     private boolean isSoulbound(ItemStack item) {
         if (item == null || !item.hasItemMeta()) return false;
         Byte tag = item.getItemMeta().getPersistentDataContainer()
@@ -439,6 +628,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         pane.setItemMeta(paneMeta);
         for (int i = 0; i < 27; i++) inv.setItem(i, pane);
 
+        inv.setItem(4, makeHeatSeeker());
         inv.setItem(10, makeCryptoniumSword());
         inv.setItem(11, makeLuckyPickaxe());
         inv.setItem(12, makeCryptoniumHelmet());
@@ -460,6 +650,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         if (!(event.getWhoClicked() instanceof Player player)) return;
 
         switch (event.getSlot()) {
+            case 4 -> buy(player, makeHeatSeeker(), PRICE_HEATSEEKER, "Heat Seeker");
             case 10 -> buy(player, makeCryptoniumSword(), PRICE_SWORD, "Cryptonium Sword");
             case 11 -> buy(player, makeLuckyPickaxe(), PRICE_PICKAXE, "Lucky Pickaxe");
             case 12 -> buy(player, makeCryptoniumHelmet(), PRICE_HELMET, "Cryptonium Helmet");
@@ -966,6 +1157,10 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         if (safeCenter != null) player.setCompassTarget(safeCenter);
         player.sendMessage(plain("Good luck. Follow your Village Compass (or the beacon beam) to the safe cash-out zone.",
                 NamedTextColor.AQUA));
+        getServer().getScheduler().runTaskLater(this, () -> player.showTitle(Title.title(
+                Component.text("ENTERING THE WILDS").color(NamedTextColor.GREEN).decorate(TextDecoration.BOLD),
+                plain("SolPlex - mine, survive, cash out.", NamedTextColor.GRAY),
+                Title.Times.times(Duration.ofMillis(300), Duration.ofMillis(2200), Duration.ofMillis(600)))), 5L);
     }
 
     private Location getOrCreateSpawn(Player player) {
@@ -1021,10 +1216,17 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
-        player.sendMessage(plain("Welcome! Mine Cryptonium, bank it in your vault, cash it out.", NamedTextColor.AQUA));
+        player.sendMessage(plain("Welcome to SolPlex! Mine Cryptonium, bank it in your vault, cash it out.",
+                NamedTextColor.AQUA));
+        // Give a vault chest only if they don't carry one AND don't have one placed.
         if (!hasVaultChestItem(player) && !chestOwners.containsValue(player.getUniqueId())) {
             giveOrDrop(player, makeVaultChest(player.getUniqueId()));
             player.sendMessage(plain("You've been given your Personal Vault chest. Place it to store Cryptonium.",
+                    NamedTextColor.LIGHT_PURPLE));
+        }
+        if (!hasVaultCompass(player)) {
+            giveOrDrop(player, makeVaultCompass());
+            player.sendMessage(plain("You've been given a Vault Compass - it always points to your placed vault.",
                     NamedTextColor.LIGHT_PURPLE));
         }
         if (!hasVillageCompass(player)) {
@@ -1033,10 +1235,14 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                     NamedTextColor.GOLD));
         }
         if (safeCenter != null) player.setCompassTarget(safeCenter);
-        // Everyone starts each session in the lobby.
+        // Everyone starts each session in the lobby, with the SolPlex welcome.
         getServer().getScheduler().runTask(this, () -> {
             if (lobbySpawn != null) player.teleport(lobbySpawn);
         });
+        getServer().getScheduler().runTaskLater(this, () -> player.showTitle(Title.title(
+                Component.text("Welcome to SolPlex").color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD),
+                plain("The Lobby - gear up, then enter the world.", NamedTextColor.GRAY),
+                Title.Times.times(Duration.ofMillis(400), Duration.ofMillis(2500), Duration.ofMillis(600)))), 10L);
     }
 
     // ---------- Wallets + cashout ----------
@@ -1403,6 +1609,10 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                 }
                 if (inLobby(player.getLocation()) && player.getLocation().getY() < 60 && lobbySpawn != null) {
                     player.teleport(lobbySpawn);
+                }
+                if (player.getWorld() == gameWorld) {
+                    updateHeatSeekers(player);
+                    updateVaultCompasses(player);
                 }
             }
         }, 20L, 20L);
