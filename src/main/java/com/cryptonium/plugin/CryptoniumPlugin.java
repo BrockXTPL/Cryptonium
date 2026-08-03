@@ -6,11 +6,15 @@ import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.title.Title;
 import org.bukkit.ChatColor;
+import org.bukkit.Color;
+import org.bukkit.FireworkEffect;
 import org.bukkit.GameMode;
 import org.bukkit.GameRule;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Particle;
+import org.bukkit.Sound;
 import org.bukkit.Tag;
 import org.bukkit.World;
 import org.bukkit.WorldCreator;
@@ -28,6 +32,7 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Display;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Firework;
 import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.TextDisplay;
 import org.bukkit.entity.Player;
@@ -62,6 +67,7 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.CompassMeta;
+import org.bukkit.inventory.meta.FireworkMeta;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -81,6 +87,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -144,6 +151,9 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private static final int PRICE_BOOTS = 20;
     private static final int PRICE_POTION = 60;
     private static final int PRICE_HEATSEEKER = 25;
+    private static final int PRICE_BOUNTY = 50;
+    private static final long BOUNTY_DURATION_MS = 10L * 60L * 1000L; // 10 minutes
+    private static final int CELEBRATION_MIN = 20; // cashouts this big get fireworks
 
     private NamespacedKey cryptoniumKey;
     private NamespacedKey oreItemKey;
@@ -155,6 +165,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private NamespacedKey potionKey;
     private NamespacedKey heatKey;
     private NamespacedKey vaultCompassKey;
+    private NamespacedKey bountyItemKey;
 
     private final Set<String> oreLocations = new HashSet<>();
     private File oreFile;
@@ -181,6 +192,10 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     private Team glowTeam;
     private Team glowTeamOff;
+    private Team bountyTeam;
+    private Team bountyTeamOff;
+    private final Map<UUID, Long> bountyUntil = new HashMap<>();
+    private final Map<UUID, String> bountyNames = new HashMap<>();
     private Scoreboard mainBoard;
     private Scoreboard offBoard;
     private Objective sidebarObjective;
@@ -221,6 +236,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         potionKey = new NamespacedKey(this, "cn_potion");
         heatKey = new NamespacedKey(this, "cn_heat");
         vaultCompassKey = new NamespacedKey(this, "cn_vaultcompass");
+        bountyItemKey = new NamespacedKey(this, "cn_bounty_item");
         boardKey = new NamespacedKey(this, "cn_board");
         getServer().getPluginManager().registerEvents(this, this);
         loadAllFiles();
@@ -462,6 +478,100 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         return tag != null && tag == (byte) 1;
     }
 
+    public ItemStack makeBountyBeacon() {
+        ItemStack item = new ItemStack(Material.ECHO_SHARD);
+        ItemMeta meta = item.getItemMeta();
+        applyShopMeta(meta, "Bounty Beacon", NamedTextColor.RED,
+                List.of("Right-click: puts a 10-minute bounty",
+                        "on the nearest player - they glow",
+                        "RED for everyone to see.",
+                        "One-time use."), PRICE_BOUNTY);
+        meta.getPersistentDataContainer().set(bountyItemKey, PersistentDataType.BYTE, (byte) 1);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private boolean isBountyBeacon(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        Byte tag = item.getItemMeta().getPersistentDataContainer()
+                .get(bountyItemKey, PersistentDataType.BYTE);
+        return tag != null && tag == (byte) 1;
+    }
+
+    @EventHandler
+    public void onBountyUse(PlayerInteractEvent event) {
+        if (event.getAction() != Action.RIGHT_CLICK_AIR
+                && event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        ItemStack item = event.getItem();
+        if (!isBountyBeacon(item)) return;
+        event.setCancelled(true);
+
+        Player player = event.getPlayer();
+        if (player.getWorld() != gameWorld) {
+            player.sendMessage(plain("Use the Bounty Beacon out in the wilds.", NamedTextColor.RED));
+            return;
+        }
+        Player target = null;
+        double best = Double.MAX_VALUE;
+        for (Player q : getServer().getOnlinePlayers()) {
+            if (q == player || q.getWorld() != gameWorld || q.isDead()) continue;
+            double d = q.getLocation().distanceSquared(player.getLocation());
+            if (d < best) {
+                best = d;
+                target = q;
+            }
+        }
+        if (target == null) {
+            player.sendMessage(plain("No other players in the wilds to bounty.", NamedTextColor.YELLOW));
+            return;
+        }
+        if (bountyUntil.containsKey(target.getUniqueId())) {
+            player.sendMessage(plain(target.getName() + " already has an active bounty.", NamedTextColor.YELLOW));
+            return;
+        }
+
+        item.setAmount(item.getAmount() - 1); // consumed
+        bountyUntil.put(target.getUniqueId(), System.currentTimeMillis() + BOUNTY_DURATION_MS);
+        bountyNames.put(target.getUniqueId(), target.getName());
+        getServer().broadcast(plain("BOUNTY PLACED: " + player.getName() + " marked "
+                + target.getName() + " - they glow RED for 10 minutes!", NamedTextColor.RED));
+        playSoundAll(Sound.ENTITY_ENDER_DRAGON_GROWL, 0.5f, 1.2f);
+        target.playSound(target.getLocation(), Sound.ENTITY_ELDER_GUARDIAN_CURSE, 1f, 1f);
+        target.sendMessage(plain("A bounty was placed on YOU. Survive 10 minutes!", NamedTextColor.RED));
+    }
+
+    private void clearBountyTeams(String name) {
+        if (bountyTeam != null && bountyTeam.hasEntry(name)) bountyTeam.removeEntry(name);
+        if (bountyTeamOff != null && bountyTeamOff.hasEntry(name)) bountyTeamOff.removeEntry(name);
+    }
+
+    // ---------- Sound / particle helpers ----------
+
+    private void playSoundAll(Sound sound, float volume, float pitch) {
+        for (Player p : getServer().getOnlinePlayers()) {
+            p.playSound(p.getLocation(), sound, volume, pitch);
+        }
+    }
+
+    private void launchFireworks(Location center, int count) {
+        for (int i = 0; i < count; i++) {
+            int delay = i * 12;
+            getServer().getScheduler().runTaskLater(this, () -> {
+                Location loc = center.clone().add(random.nextDouble() * 6 - 3, 1, random.nextDouble() * 6 - 3);
+                Firework fw = loc.getWorld().spawn(loc, Firework.class);
+                FireworkMeta fm = fw.getFireworkMeta();
+                fm.addEffect(FireworkEffect.builder()
+                        .withColor(Color.PURPLE, Color.AQUA, Color.ORANGE)
+                        .withFade(Color.WHITE)
+                        .with(FireworkEffect.Type.BALL_LARGE)
+                        .trail(true)
+                        .build());
+                fm.setPower(1);
+                fw.setFireworkMeta(fm);
+            }, delay);
+        }
+    }
+
     public ItemStack makeVaultCompass() {
         ItemStack item = new ItemStack(Material.COMPASS);
         CompassMeta meta = (CompassMeta) item.getItemMeta();
@@ -647,6 +757,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         for (int i = 0; i < 27; i++) inv.setItem(i, pane);
 
         inv.setItem(4, makeHeatSeeker());
+        inv.setItem(22, makeBountyBeacon());
         inv.setItem(10, makeCryptoniumSword());
         inv.setItem(11, makeLuckyPickaxe());
         inv.setItem(12, makeCryptoniumHelmet());
@@ -669,6 +780,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
         switch (event.getSlot()) {
             case 4 -> buy(player, makeHeatSeeker(), PRICE_HEATSEEKER, "Heat Seeker");
+            case 22 -> buy(player, makeBountyBeacon(), PRICE_BOUNTY, "Bounty Beacon");
             case 10 -> buy(player, makeCryptoniumSword(), PRICE_SWORD, "Cryptonium Sword");
             case 11 -> buy(player, makeLuckyPickaxe(), PRICE_PICKAXE, "Lucky Pickaxe");
             case 12 -> buy(player, makeCryptoniumHelmet(), PRICE_HELMET, "Cryptonium Helmet");
@@ -692,10 +804,15 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         if (!chargeCryptonium(player, price)) {
             player.sendMessage(plain("You need " + price + " Cryptonium for " + name
                     + " (you have " + countCarried(player) + ").", NamedTextColor.RED));
+            player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_NO, 1f, 1f);
             return;
         }
         giveOrDrop(player, item);
         player.sendMessage(plain("Bought " + name + " for " + price + " Cryptonium!", NamedTextColor.GREEN));
+        player.playSound(player.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1f, 1.4f);
+        player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_YES, 0.8f, 1f);
+        player.getWorld().spawnParticle(Particle.HAPPY_VILLAGER,
+                player.getLocation().add(0, 1.2, 0), 12, 0.4, 0.4, 0.4, 0);
     }
 
     private boolean chargeCryptonium(Player player, int amount) {
@@ -739,6 +856,10 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         player.setFireTicks(0);
         player.setCooldown(Material.EXPERIENCE_BOTTLE, (int) (POTION_COOLDOWN_MS / 50L));
         player.sendMessage(plain("Fully healed! Potion recharges in 5 minutes.", NamedTextColor.GREEN));
+        player.playSound(player.getLocation(), Sound.ENTITY_GENERIC_DRINK, 1f, 1f);
+        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 0.7f, 1.8f);
+        player.getWorld().spawnParticle(Particle.HEART,
+                player.getLocation().add(0, 1.5, 0), 10, 0.5, 0.5, 0.5, 0);
     }
 
     // ---------- Lobby world ----------
@@ -1122,12 +1243,14 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                     Component.text("SAFE ZONE").color(NamedTextColor.GREEN).decorate(TextDecoration.BOLD),
                     plain("No PvP. No building. Cash out with the banker.", NamedTextColor.GRAY),
                     Title.Times.times(Duration.ofMillis(200), Duration.ofMillis(2000), Duration.ofMillis(500))));
+            player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 0.8f, 1.6f);
         } else {
             insideZone.remove(player.getUniqueId());
             player.showTitle(Title.title(
                     Component.text("LEAVING SAFE ZONE").color(NamedTextColor.RED).decorate(TextDecoration.BOLD),
                     plain("PvP enabled - watch your Cryptonium!", NamedTextColor.GRAY),
                     Title.Times.times(Duration.ofMillis(200), Duration.ofMillis(2000), Duration.ofMillis(500))));
+            player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 0.8f, 0.6f);
         }
     }
 
@@ -1172,6 +1295,8 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private void sendToGame(Player player) {
         Location spawn = getOrCreateSpawn(player);
         player.teleport(spawn);
+        player.playSound(spawn, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 1f);
+        spawn.getWorld().spawnParticle(Particle.PORTAL, spawn.clone().add(0, 1, 0), 40, 0.4, 0.8, 0.4, 0.3);
         if (safeCenter != null) player.setCompassTarget(safeCenter);
         player.sendMessage(plain("Good luck. Follow your Village Compass (or the beacon beam) to the safe cash-out zone.",
                 NamedTextColor.AQUA));
@@ -1227,6 +1352,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             getServer().getScheduler().runTask(this, () -> {
                 for (ItemStack it : keep) giveOrDrop(player, it);
                 player.sendMessage(plain("Your soulbound items stayed with you.", NamedTextColor.LIGHT_PURPLE));
+                player.playSound(player.getLocation(), Sound.ITEM_TOTEM_USE, 0.4f, 1.4f);
             });
         }
     }
@@ -1341,6 +1467,16 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         player.sendMessage(plain("Cashed out " + amount + " Cryptonium!", NamedTextColor.GREEN));
         player.sendMessage(plain(String.format("%,d", tokens) + " tokens queued for payout to "
                 + shortWallet(wallet), NamedTextColor.GREEN));
+        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1f, 1f);
+        player.getWorld().spawnParticle(Particle.TOTEM_OF_UNDYING,
+                player.getLocation().add(0, 1.2, 0), 40, 0.5, 0.8, 0.5, 0.15);
+        if (amount >= CELEBRATION_MIN) {
+            getServer().broadcast(plain("BIG CASHOUT: " + player.getName() + " just cashed "
+                    + amount + " Cryptonium (" + String.format("%,d", tokens) + " tokens)!",
+                    NamedTextColor.GOLD));
+            playSoundAll(Sound.UI_TOAST_CHALLENGE_COMPLETE, 1f, 1f);
+            if (safeCenter != null) launchFireworks(safeCenter.clone().add(0, 2, 0), 5);
+        }
     }
 
     private int removeAllCryptonium(Player player) {
@@ -1408,6 +1544,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             saveVaults();
             player.sendMessage(plain("Vault placed. You can't pick it up for " + lockLabel() + ".",
                     NamedTextColor.LIGHT_PURPLE));
+            player.playSound(event.getBlockPlaced().getLocation(), Sound.BLOCK_ENDER_CHEST_OPEN, 1f, 0.8f);
         }
     }
 
@@ -1450,6 +1587,9 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                         ? "Lucky strike! You mined " + dropAmount + " Cryptonium!"
                         : "You mined Cryptonium!",
                 NamedTextColor.AQUA));
+        Location oreLoc = block.getLocation().add(0.5, 0.5, 0.5);
+        block.getWorld().playSound(oreLoc, Sound.ENTITY_PLAYER_LEVELUP, 0.8f, 1.6f);
+        block.getWorld().spawnParticle(Particle.WITCH, oreLoc, 25, 0.35, 0.35, 0.35, 0);
     }
 
     private boolean isAllowedPickaxe(Material m) {
@@ -1498,6 +1638,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         saveVaults();
         giveOrDrop(player, makeVaultChest(owner));
         player.sendMessage(plain("You picked up your vault.", NamedTextColor.LIGHT_PURPLE));
+        player.playSound(block.getLocation(), Sound.BLOCK_ENDER_CHEST_CLOSE, 1f, 1.2f);
     }
 
     @EventHandler
@@ -1562,6 +1703,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         getServer().broadcast(plain(
                 player.getName() + " picked up " + stack.getAmount() + " Cryptonium!",
                 NamedTextColor.GREEN));
+        player.playSound(player.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1f, 0.8f);
     }
 
     @EventHandler
@@ -1601,10 +1743,28 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             }
         }
 
-        if (total > 0) {
+        // Kill feed + bounty resolution.
+        Player killer = player.getKiller();
+        boolean wasBountied = bountyUntil.remove(player.getUniqueId()) != null;
+        String bountyName = bountyNames.remove(player.getUniqueId());
+        if (wasBountied) clearBountyTeams(bountyName != null ? bountyName : player.getName());
+
+        if (killer != null && killer != player) {
+            String feed = "[KILL] " + killer.getName() + " killed " + player.getName()
+                    + (total > 0 ? " - " + total + " Cryptonium dropped!" : "!");
+            getServer().broadcast(plain(feed, NamedTextColor.RED));
+            killer.playSound(killer.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1f, 1.2f);
+            if (wasBountied) {
+                getServer().broadcast(plain("BOUNTY CLAIMED: " + killer.getName() + " took down "
+                        + player.getName() + "!", NamedTextColor.GOLD));
+                playSoundAll(Sound.UI_TOAST_CHALLENGE_COMPLETE, 0.8f, 1f);
+            }
+            if (total > 0) playSoundAll(Sound.BLOCK_BELL_USE, 0.7f, 0.8f);
+        } else if (total > 0) {
             getServer().broadcast(plain(
                     player.getName() + " dropped " + total + " Cryptonium! Grab it before someone else does.",
                     NamedTextColor.GOLD));
+            playSoundAll(Sound.BLOCK_BELL_USE, 0.7f, 0.8f);
         }
     }
 
@@ -1617,11 +1777,21 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         team.setColor(ChatColor.LIGHT_PURPLE);
         glowTeam = team;
 
+        Team bounty = mainBoard.getTeam("cn_bounty");
+        if (bounty == null) {
+            bounty = mainBoard.registerNewTeam("cn_bounty");
+        }
+        bounty.setColor(ChatColor.RED);
+        bountyTeam = bounty;
+
         // Second board for players who toggled the sidebar off (glow still mirrored).
         offBoard = getServer().getScoreboardManager().getNewScoreboard();
         Team off = offBoard.registerNewTeam(GLOW_TEAM);
         off.setColor(ChatColor.LIGHT_PURPLE);
         glowTeamOff = off;
+        Team bountyOff = offBoard.registerNewTeam("cn_bounty");
+        bountyOff.setColor(ChatColor.RED);
+        bountyTeamOff = bountyOff;
 
         // Active-players sidebar on the main board.
         Objective existing = mainBoard.getObjective("cn_online");
@@ -1737,14 +1907,40 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     private void startMainTask() {
         getServer().getScheduler().runTaskTimer(this, () -> {
+            // Expire finished bounties.
+            long nowMs = System.currentTimeMillis();
+            Iterator<Map.Entry<UUID, Long>> it = bountyUntil.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<UUID, Long> entry = it.next();
+                if (nowMs > entry.getValue()) {
+                    String bName = bountyNames.remove(entry.getKey());
+                    if (bName != null) {
+                        clearBountyTeams(bName);
+                        getServer().broadcast(plain("The bounty on " + bName + " has expired - they survived!",
+                                NamedTextColor.YELLOW));
+                    }
+                    it.remove();
+                }
+            }
+
             for (Player player : getServer().getOnlinePlayers()) {
                 boolean carrying = isCarryingCryptonium(player);
+                boolean bountied = bountyUntil.containsKey(player.getUniqueId());
                 String name = player.getName();
-                if (carrying) {
+                if (bountied) {
+                    // Bounty red overrides the purple carrier glow.
+                    if (glowTeam.hasEntry(name)) glowTeam.removeEntry(name);
+                    if (glowTeamOff != null && glowTeamOff.hasEntry(name)) glowTeamOff.removeEntry(name);
+                    if (bountyTeam != null && !bountyTeam.hasEntry(name)) bountyTeam.addEntry(name);
+                    if (bountyTeamOff != null && !bountyTeamOff.hasEntry(name)) bountyTeamOff.addEntry(name);
+                    player.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 40, 0, false, false));
+                } else if (carrying) {
+                    clearBountyTeams(name);
                     if (!glowTeam.hasEntry(name)) glowTeam.addEntry(name);
                     if (glowTeamOff != null && !glowTeamOff.hasEntry(name)) glowTeamOff.addEntry(name);
                     player.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 40, 0, false, false));
                 } else {
+                    clearBountyTeams(name);
                     if (glowTeam.hasEntry(name)) glowTeam.removeEntry(name);
                     if (glowTeamOff != null && glowTeamOff.hasEntry(name)) glowTeamOff.removeEntry(name);
                     player.removePotionEffect(PotionEffectType.GLOWING);
