@@ -139,7 +139,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private static final int SPAWN_RING_MIN = 42;
     private static final int SPAWN_RING_MAX = 58;
     private static final int VILLAGE_SEARCH_RADIUS_CHUNKS = 64;
-    private static final long TOKENS_PER_CRYPTONIUM = 150_000L;
+    private static final long TOKENS_PER_CRYPTONIUM = 5_000L;
     private static final String B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
     // Shop prices (in Cryptonium).
