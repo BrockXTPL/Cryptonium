@@ -4,12 +4,14 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
+import net.kyori.adventure.title.Title;
 import org.bukkit.ChatColor;
 import org.bukkit.GameMode;
 import org.bukkit.GameRule;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Tag;
 import org.bukkit.World;
 import org.bukkit.WorldCreator;
 import org.bukkit.block.Block;
@@ -42,6 +44,8 @@ import org.bukkit.event.entity.VillagerAcquireTradeEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.world.LootGenerateEvent;
 import org.bukkit.generator.ChunkGenerator;
@@ -49,6 +53,7 @@ import org.bukkit.generator.structure.Structure;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.CompassMeta;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -61,6 +66,7 @@ import org.bukkit.util.StructureSearchResult;
 import java.io.File;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -71,33 +77,28 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Cryptonium - lobby world, central village safe zone, scattered spawns,
- * wallets + banker cashout, and everything from before.
+ * Cryptonium - lobby world, central village safe zone (with visible border and
+ * enter/exit warnings), scattered spawns, wallets + banker cashout, village
+ * compass + beacon, and everything before.
  *
- * Lobby:
- *   - Separate void world. Every login puts players in the lobby.
- *   - Rules are written on wall signs. An ENTER NPC teleports players to the map.
- *   - No damage, no hunger, no building (creative admins excepted).
+ * Village landmarks:
+ *   - Glowstone border ring marks the exact edge of the safe zone.
+ *   - Entering/leaving the zone shows big on-screen warnings.
+ *   - Every player carries a Village Compass pointing at the village.
+ *   - A beacon beam at the village is visible from far away.
  *
  * Central village (cash zone):
- *   - Nearest natural village to world center becomes the safe zone (radius 80).
- *   - Inside: invincible, no PvP in or out, no break/place, explosion-proof.
- *   - A CRYPTONIUM BANKER NPC stands at its center for cashing out.
+ *   - Safe zone radius 80: invincible, no PvP, no building, explosion-proof.
+ *   - CRYPTONIUM BANKER NPC cashes carried Cryptonium into queued payouts.
  *
- * Spawns:
- *   - Each player gets a personal spawn 250-450 blocks from the village.
- *   - Beds/anchors override it; otherwise deaths respawn there.
- *
- * Wallets & cashout:
- *   - /wallet set <address> (validated base58, saved forever, works anywhere).
- *   - Right-click the banker with Cryptonium in inventory -> confirm click ->
- *     Cryptonium removed, payout queued to payouts.yml at 150,000 tokens each.
- *
- * Vault chests: private, protected, 10-minute pickup lock after placing.
- * Diamonds -> Cryptonium everywhere (ore drops, generated loot, no diamond trades).
+ * Lobby: void world, rules on signs, ENTER NPC. Every login starts there.
+ * Spawns: personal spawn 250-450 blocks from the village; beds override.
+ * Wallets: /wallet set <address> - validated, saved forever.
+ * Vaults: private chests, 10-minute pickup lock.
+ * Diamonds -> Cryptonium everywhere.
  *
  * Commands:
- *   /cryptonium give [n] | ore [n] | chest
+ *   /cryptonium give [n] | ore [n] | chest | compass
  *   /wallet set <addr> | /wallet | /wallet clear
  *   /cnadmin <password> [banker|enter]
  */
@@ -120,6 +121,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private NamespacedKey oreItemKey;
     private NamespacedKey vaultOwnerKey;
     private NamespacedKey npcKey;
+    private NamespacedKey compassKey;
 
     private final Set<String> oreLocations = new HashSet<>();
     private File oreFile;
@@ -147,6 +149,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     private Team glowTeam;
     private final Random random = new Random();
+    private final Set<UUID> insideZone = new HashSet<>();
 
     /** Empty chunks = a void world for the lobby. */
     public static final class VoidGenerator extends ChunkGenerator {
@@ -158,13 +161,14 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         oreItemKey = new NamespacedKey(this, "cryptonium_ore");
         vaultOwnerKey = new NamespacedKey(this, "vault_owner");
         npcKey = new NamespacedKey(this, "cn_npc");
+        compassKey = new NamespacedKey(this, "cn_compass");
         getServer().getPluginManager().registerEvents(this, this);
         loadAllFiles();
         setupLobby();
         setupGameWorld();
         setupGlowTeam();
         startMainTask();
-        getLogger().info("Cryptonium is enabled. Lobby + safe zone + banker are ready.");
+        getLogger().info("Cryptonium is enabled. Lobby, safe zone, border, banker, and beacon are ready.");
     }
 
     @Override
@@ -244,6 +248,37 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    public ItemStack makeVillageCompass() {
+        ItemStack item = new ItemStack(Material.COMPASS, 1);
+        CompassMeta meta = (CompassMeta) item.getItemMeta();
+        meta.displayName(plain("Village Compass", NamedTextColor.GOLD));
+        meta.lore(List.of(
+                plain("Points to the central village", NamedTextColor.GRAY),
+                plain("(the safe cash-out zone).", NamedTextColor.GRAY)
+        ));
+        if (safeCenter != null) {
+            meta.setLodestone(safeCenter);
+            meta.setLodestoneTracked(false); // point at the coords forever, no lodestone needed
+        }
+        meta.getPersistentDataContainer().set(compassKey, PersistentDataType.BYTE, (byte) 1);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private boolean isVillageCompass(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        Byte tag = item.getItemMeta().getPersistentDataContainer()
+                .get(compassKey, PersistentDataType.BYTE);
+        return tag != null && tag == (byte) 1;
+    }
+
+    private boolean hasVillageCompass(Player player) {
+        for (ItemStack it : player.getInventory().getContents()) {
+            if (isVillageCompass(it)) return true;
+        }
+        return false;
+    }
+
     // ---------- Lobby world ----------
 
     private void setupLobby() {
@@ -276,7 +311,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     }
 
     private void buildLobby(World w) {
-        // Floor 25x25 at y=100, purpur wall around it, y=101..103.
         for (int x = -12; x <= 12; x++) {
             for (int z = -12; z <= 12; z++) {
                 w.getBlockAt(x, 100, z).setType(Material.SMOOTH_QUARTZ);
@@ -287,14 +321,12 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                 }
             }
         }
-        // Lighting.
         int[] grid = {-8, 0, 8};
         for (int x : grid) {
             for (int z : grid) {
                 w.getBlockAt(x, 100, z).setType(Material.SEA_LANTERN);
             }
         }
-        // Rule boards. North wall signs face SOUTH, south wall signs face NORTH.
         String[][] north = {
                 {"CRYPTONIUM", "Mine diamond", "ore to get", "Cryptonium"},
                 {"DANGER", "Carrying it =", "purple glow +", "drops on death"},
@@ -383,6 +415,66 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             stateConfig.set("bankerSpawned", true);
             saveState();
         }
+
+        if (!stateConfig.getBoolean("beaconBuilt", false)) {
+            buildVillageBeacon();
+            stateConfig.set("beaconBuilt", true);
+            saveState();
+            getLogger().info("Village beacon built.");
+        }
+
+        if (!stateConfig.getBoolean("borderBuilt", false)) {
+            getLogger().info("Building the safe-zone border ring (one-time)...");
+            buildSafeZoneBorder();
+            stateConfig.set("borderBuilt", true);
+            saveState();
+            getLogger().info("Safe-zone border built.");
+        }
+    }
+
+    /** A beacon on a 3x3 iron base near the banker, with a cleared column so the beam shows. */
+    private void buildVillageBeacon() {
+        if (safeCenter == null) return;
+        int bx = safeCenter.getBlockX() + 6;
+        int bz = safeCenter.getBlockZ();
+        int ground = gameWorld.getHighestBlockYAt(bx, bz);
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                gameWorld.getBlockAt(bx + dx, ground + 1, bz + dz).setType(Material.IRON_BLOCK);
+            }
+        }
+        gameWorld.getBlockAt(bx, ground + 2, bz).setType(Material.BEACON);
+        int top = Math.min(ground + 60, gameWorld.getMaxHeight() - 1);
+        for (int y = ground + 3; y <= top; y++) {
+            Block b = gameWorld.getBlockAt(bx, y, bz);
+            if (!b.getType().isAir()) b.setType(Material.AIR);
+        }
+    }
+
+    /** Glowstone ring set into the ground along the exact safe-zone radius. */
+    private void buildSafeZoneBorder() {
+        if (safeCenter == null) return;
+        int cx = safeCenter.getBlockX();
+        int cz = safeCenter.getBlockZ();
+        Set<Long> placed = new HashSet<>();
+        int steps = 1440;
+        for (int i = 0; i < steps; i++) {
+            double angle = (Math.PI * 2 * i) / steps;
+            int x = cx + (int) Math.round(Math.cos(angle) * SAFE_ZONE_RADIUS);
+            int z = cz + (int) Math.round(Math.sin(angle) * SAFE_ZONE_RADIUS);
+            long key = (((long) x) << 32) ^ (z & 0xffffffffL);
+            if (!placed.add(key)) continue;
+            Block top = gameWorld.getHighestBlockAt(x, z);
+            // Skip down through tree canopies so the ring sits on real ground.
+            int guard = 0;
+            while (guard++ < 32 && top.getY() > gameWorld.getMinHeight()
+                    && (top.getType().isAir()
+                    || Tag.LEAVES.isTagged(top.getType())
+                    || Tag.LOGS.isTagged(top.getType()))) {
+                top = gameWorld.getBlockAt(x, top.getY() - 1, z);
+            }
+            top.setType(Material.GLOWSTONE);
+        }
     }
 
     private boolean inLobby(Location l) {
@@ -400,6 +492,41 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private boolean isBuildProtected(Player p, Location l) {
         if (p.getGameMode() == GameMode.CREATIVE) return false;
         return inLobby(l) || inSafeZone(l);
+    }
+
+    // ---------- Safe-zone enter/exit warnings ----------
+
+    @EventHandler
+    public void onMove(PlayerMoveEvent event) {
+        Location to = event.getTo();
+        if (to == null) return;
+        Location from = event.getFrom();
+        if (from.getBlockX() == to.getBlockX() && from.getBlockZ() == to.getBlockZ()
+                && from.getWorld() == to.getWorld()) {
+            return;
+        }
+        Player player = event.getPlayer();
+        boolean now = inSafeZone(to);
+        boolean was = insideZone.contains(player.getUniqueId());
+        if (now == was) return;
+        if (now) {
+            insideZone.add(player.getUniqueId());
+            player.showTitle(Title.title(
+                    Component.text("SAFE ZONE").color(NamedTextColor.GREEN).decorate(TextDecoration.BOLD),
+                    plain("No PvP. No building. Cash out with the banker.", NamedTextColor.GRAY),
+                    Title.Times.times(Duration.ofMillis(200), Duration.ofMillis(2000), Duration.ofMillis(500))));
+        } else {
+            insideZone.remove(player.getUniqueId());
+            player.showTitle(Title.title(
+                    Component.text("LEAVING SAFE ZONE").color(NamedTextColor.RED).decorate(TextDecoration.BOLD),
+                    plain("PvP enabled - watch your Cryptonium!", NamedTextColor.GRAY),
+                    Title.Times.times(Duration.ofMillis(200), Duration.ofMillis(2000), Duration.ofMillis(500))));
+        }
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        insideZone.remove(event.getPlayer().getUniqueId());
     }
 
     // ---------- NPCs ----------
@@ -436,7 +563,9 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private void sendToGame(Player player) {
         Location spawn = getOrCreateSpawn(player);
         player.teleport(spawn);
-        player.sendMessage(plain("Good luck. The central village is the safe cash-out zone.", NamedTextColor.AQUA));
+        if (safeCenter != null) player.setCompassTarget(safeCenter);
+        player.sendMessage(plain("Good luck. Follow your Village Compass (or the beacon beam) to the safe cash-out zone.",
+                NamedTextColor.AQUA));
     }
 
     private Location getOrCreateSpawn(Player player) {
@@ -491,6 +620,12 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             player.sendMessage(plain("You've been given your Personal Vault chest. Place it to store Cryptonium.",
                     NamedTextColor.LIGHT_PURPLE));
         }
+        if (!hasVillageCompass(player)) {
+            giveOrDrop(player, makeVillageCompass());
+            player.sendMessage(plain("You've been given a Village Compass - it always points to the cash-out village.",
+                    NamedTextColor.GOLD));
+        }
+        if (safeCenter != null) player.setCompassTarget(safeCenter);
         // Everyone starts each session in the lobby.
         getServer().getScheduler().runTask(this, () -> {
             if (lobbySpawn != null) player.teleport(lobbySpawn);
@@ -830,7 +965,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private void startMainTask() {
         getServer().getScheduler().runTaskTimer(this, () -> {
             for (Player player : getServer().getOnlinePlayers()) {
-                // Purple glow while carrying Cryptonium.
                 boolean carrying = isCarryingCryptonium(player);
                 String name = player.getName();
                 if (carrying) {
@@ -840,7 +974,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                     if (glowTeam.hasEntry(name)) glowTeam.removeEntry(name);
                     player.removePotionEffect(PotionEffectType.GLOWING);
                 }
-                // Rescue anyone who falls off the lobby platform.
                 if (inLobby(player.getLocation()) && player.getLocation().getY() < 60 && lobbySpawn != null) {
                     player.teleport(lobbySpawn);
                 }
@@ -1016,9 +1149,14 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
                     giveOrDrop(player, makeVaultChest(player.getUniqueId()));
                     player.sendMessage(plain("Here's a Personal Vault chest.", NamedTextColor.LIGHT_PURPLE));
                 }
+                case "compass" -> {
+                    giveOrDrop(player, makeVillageCompass());
+                    player.sendMessage(plain("Here's a Village Compass - it always points to the cash-out village.",
+                            NamedTextColor.GOLD));
+                }
                 case "confirmcash" -> confirmCashout(player);
                 default -> player.sendMessage(plain(
-                        "Commands: /cryptonium give | ore | chest   Wallet: /wallet set <address>",
+                        "Commands: /cryptonium give | ore | chest | compass   Wallet: /wallet set <address>",
                         NamedTextColor.AQUA));
             }
             return true;
