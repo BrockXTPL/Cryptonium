@@ -14,6 +14,7 @@ import org.bukkit.NamespacedKey;
 import org.bukkit.Tag;
 import org.bukkit.World;
 import org.bukkit.WorldCreator;
+import org.bukkit.attribute.Attribute;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.Chest;
@@ -24,7 +25,9 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
 import org.bukkit.entity.Villager;
@@ -41,6 +44,8 @@ import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.FoodLevelChangeEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.entity.VillagerAcquireTradeEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
@@ -52,6 +57,7 @@ import org.bukkit.generator.ChunkGenerator;
 import org.bukkit.generator.structure.Structure;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.CompassMeta;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -77,38 +83,45 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Cryptonium - lobby world, central village safe zone (with visible border and
- * enter/exit warnings), scattered spawns, wallets + banker cashout, village
- * compass + beacon, and everything before.
+ * Cryptonium - full game plugin.
  *
- * Village landmarks:
- *   - Glowstone border ring marks the exact edge of the safe zone.
- *   - Entering/leaving the zone shows big on-screen warnings.
- *   - Every player carries a Village Compass pointing at the village.
- *   - A beacon beam at the village is visible from far away.
+ * New in this version:
+ *   - Permanent daytime + clear weather in the game world.
+ *   - SHOP NPCs (lobby + village) opening a GUI shop paid in Cryptonium.
+ *   - Shop items: Lucky Pickaxe (3x yield, diamond durability), Cryptonium
+ *     Sword, Cryptonium Armor set, Cryptonium Potion (infinite full-heal,
+ *     5-minute cooldown).
+ *   - Soulbound: shop items, vault chest, and compass never drop on death -
+ *     they're returned on respawn. Cryptonium itself still drops.
+ *   - Village shop building (spruce market with item-frame displays) and a
+ *     quartz/gold cashout station around the banker. Lobby gets a shop stall.
+ *   - Players are re-given their vault chest on login if they have none.
  *
- * Central village (cash zone):
- *   - Safe zone radius 80: invincible, no PvP, no building, explosion-proof.
- *   - CRYPTONIUM BANKER NPC cashes carried Cryptonium into queued payouts.
- *
- * Lobby: void world, rules on signs, ENTER NPC. Every login starts there.
- * Spawns: personal spawn 250-450 blocks from the village; beds override.
- * Wallets: /wallet set <address> - validated, saved forever.
- * Vaults: private chests, 10-minute pickup lock.
- * Diamonds -> Cryptonium everywhere.
+ * Existing:
+ *   - Lobby void world (rules on signs, ENTER NPC), every login starts there.
+ *   - Central village safe zone r80: invincible, no PvP, no building,
+ *     explosion-proof, glowstone border ring, enter/exit warning titles.
+ *   - CRYPTONIUM BANKER cashes carried Cryptonium into queued payouts
+ *     (150,000 tokens each) to the player's saved, validated Solana wallet.
+ *   - Personal spawns near the village; beds override.
+ *   - Vault chests: private, protected, 10-minute pickup lock.
+ *   - Diamonds -> Cryptonium (ore drops, generated loot, no diamond trades).
+ *   - Carry glow, pickup/death broadcasts, village compass, beacon.
  *
  * Commands:
  *   /cryptonium give [n] | ore [n] | chest | compass
  *   /wallet set <addr> | /wallet | /wallet clear
- *   /cnadmin <password> [banker|enter]
+ *   /cnadmin <password> [banker|enter|shop]
  */
 public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     private static final Material ORE_MATERIAL = Material.AMETHYST_BLOCK;
     private static final int DROP_PER_ORE = 1;
+    private static final int LUCKY_MULTIPLIER = 3;
     private static final String ADMIN_PASSWORD = "5886";
     private static final String GLOW_TEAM = "cn_carriers";
     private static final long VAULT_PICKUP_LOCK_MS = 10L * 60L * 1000L; // 10 minutes
+    private static final long POTION_COOLDOWN_MS = 5L * 60L * 1000L;    // 5 minutes
     private static final String LOBBY_WORLD_NAME = "cn_lobby";
     private static final double SAFE_ZONE_RADIUS = 80.0;
     private static final int SPAWN_RING_MIN = 85;
@@ -117,11 +130,23 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private static final long TOKENS_PER_CRYPTONIUM = 150_000L;
     private static final String B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
+    // Shop prices (in Cryptonium).
+    private static final int PRICE_SWORD = 30;
+    private static final int PRICE_PICKAXE = 40;
+    private static final int PRICE_HELMET = 20;
+    private static final int PRICE_CHESTPLATE = 35;
+    private static final int PRICE_LEGGINGS = 30;
+    private static final int PRICE_BOOTS = 20;
+    private static final int PRICE_POTION = 60;
+
     private NamespacedKey cryptoniumKey;
     private NamespacedKey oreItemKey;
     private NamespacedKey vaultOwnerKey;
     private NamespacedKey npcKey;
     private NamespacedKey compassKey;
+    private NamespacedKey soulboundKey;
+    private NamespacedKey luckyKey;
+    private NamespacedKey potionKey;
 
     private final Set<String> oreLocations = new HashSet<>();
     private File oreFile;
@@ -129,7 +154,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     private final Map<String, UUID> chestOwners = new HashMap<>();
     private final Map<String, Long> chestPlaceTime = new HashMap<>();
-    private final Set<UUID> receivedStarterChest = new HashSet<>();
     private File vaultFile;
     private FileConfiguration vaultConfig;
 
@@ -150,9 +174,21 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     private Team glowTeam;
     private final Random random = new Random();
     private final Set<UUID> insideZone = new HashSet<>();
+    private final Map<UUID, List<ItemStack>> deathKeeps = new HashMap<>();
+    private final Map<UUID, Long> potionCooldown = new HashMap<>();
 
     /** Empty chunks = a void world for the lobby. */
     public static final class VoidGenerator extends ChunkGenerator {
+    }
+
+    /** Marks our shop inventory so clicks can be identified safely. */
+    public static final class ShopHolder implements InventoryHolder {
+        private Inventory inventory;
+
+        @Override
+        public Inventory getInventory() {
+            return inventory;
+        }
     }
 
     @Override
@@ -162,13 +198,16 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         vaultOwnerKey = new NamespacedKey(this, "vault_owner");
         npcKey = new NamespacedKey(this, "cn_npc");
         compassKey = new NamespacedKey(this, "cn_compass");
+        soulboundKey = new NamespacedKey(this, "cn_soulbound");
+        luckyKey = new NamespacedKey(this, "cn_lucky");
+        potionKey = new NamespacedKey(this, "cn_potion");
         getServer().getPluginManager().registerEvents(this, this);
         loadAllFiles();
         setupLobby();
         setupGameWorld();
         setupGlowTeam();
         startMainTask();
-        getLogger().info("Cryptonium is enabled. Lobby, safe zone, border, banker, and beacon are ready.");
+        getLogger().info("Cryptonium is enabled. Lobby, safe zone, shops, banker, and beacon are ready.");
     }
 
     @Override
@@ -178,7 +217,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         getLogger().info("Cryptonium is disabled.");
     }
 
-    // ---------- Items ----------
+    // ---------- Core items ----------
 
     public ItemStack makeCryptonium(int amount) {
         ItemStack item = new ItemStack(Material.AMETHYST_SHARD, clamp(amount));
@@ -228,10 +267,12 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         meta.displayName(plain("Personal Vault", NamedTextColor.LIGHT_PURPLE));
         meta.lore(List.of(
                 plain("Only you can open this.", NamedTextColor.GRAY),
-                plain("Store Cryptonium safely inside.", NamedTextColor.GRAY)
+                plain("Store Cryptonium safely inside.", NamedTextColor.GRAY),
+                plain("Soulbound - stays with you on death.", NamedTextColor.LIGHT_PURPLE)
         ));
         meta.setEnchantmentGlintOverride(true);
         meta.getPersistentDataContainer().set(vaultOwnerKey, PersistentDataType.STRING, owner.toString());
+        meta.getPersistentDataContainer().set(soulboundKey, PersistentDataType.BYTE, (byte) 1);
         item.setItemMeta(meta);
         return item;
     }
@@ -248,19 +289,28 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private boolean hasVaultChestItem(Player player) {
+        for (ItemStack it : player.getInventory().getContents()) {
+            if (vaultItemOwner(it) != null) return true;
+        }
+        return false;
+    }
+
     public ItemStack makeVillageCompass() {
         ItemStack item = new ItemStack(Material.COMPASS, 1);
         CompassMeta meta = (CompassMeta) item.getItemMeta();
         meta.displayName(plain("Village Compass", NamedTextColor.GOLD));
         meta.lore(List.of(
                 plain("Points to the central village", NamedTextColor.GRAY),
-                plain("(the safe cash-out zone).", NamedTextColor.GRAY)
+                plain("(the safe cash-out zone).", NamedTextColor.GRAY),
+                plain("Soulbound - stays with you on death.", NamedTextColor.LIGHT_PURPLE)
         ));
         if (safeCenter != null) {
             meta.setLodestone(safeCenter);
-            meta.setLodestoneTracked(false); // point at the coords forever, no lodestone needed
+            meta.setLodestoneTracked(false);
         }
         meta.getPersistentDataContainer().set(compassKey, PersistentDataType.BYTE, (byte) 1);
+        meta.getPersistentDataContainer().set(soulboundKey, PersistentDataType.BYTE, (byte) 1);
         item.setItemMeta(meta);
         return item;
     }
@@ -277,6 +327,209 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             if (isVillageCompass(it)) return true;
         }
         return false;
+    }
+
+    // ---------- Shop items ----------
+
+    private void applyShopMeta(ItemMeta meta, String name, NamedTextColor color,
+                               List<String> desc, int price) {
+        meta.displayName(plain(name, color));
+        List<Component> lore = new ArrayList<>();
+        for (String line : desc) lore.add(plain(line, NamedTextColor.GRAY));
+        lore.add(plain("Price: " + price + " Cryptonium", NamedTextColor.AQUA));
+        lore.add(plain("Soulbound - stays with you on death.", NamedTextColor.LIGHT_PURPLE));
+        meta.lore(lore);
+        meta.setEnchantmentGlintOverride(true);
+        meta.getPersistentDataContainer().set(soulboundKey, PersistentDataType.BYTE, (byte) 1);
+    }
+
+    public ItemStack makeLuckyPickaxe() {
+        ItemStack item = new ItemStack(Material.DIAMOND_PICKAXE);
+        ItemMeta meta = item.getItemMeta();
+        applyShopMeta(meta, "Lucky Pickaxe", NamedTextColor.AQUA,
+                List.of("Mines Cryptonium at " + LUCKY_MULTIPLIER + "x yield.",
+                        "Diamond durability."), PRICE_PICKAXE);
+        meta.getPersistentDataContainer().set(luckyKey, PersistentDataType.BYTE, (byte) 1);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private boolean isLuckyPickaxe(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        Byte tag = item.getItemMeta().getPersistentDataContainer()
+                .get(luckyKey, PersistentDataType.BYTE);
+        return tag != null && tag == (byte) 1;
+    }
+
+    public ItemStack makeCryptoniumSword() {
+        ItemStack item = new ItemStack(Material.NETHERITE_SWORD);
+        ItemMeta meta = item.getItemMeta();
+        applyShopMeta(meta, "Cryptonium Sword", NamedTextColor.LIGHT_PURPLE,
+                List.of("Heavy damage (Sharpness V)."), PRICE_SWORD);
+        meta.addEnchant(Enchantment.SHARPNESS, 5, true);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private ItemStack makeArmorPiece(Material material, String name, int price) {
+        ItemStack item = new ItemStack(material);
+        ItemMeta meta = item.getItemMeta();
+        applyShopMeta(meta, name, NamedTextColor.LIGHT_PURPLE,
+                List.of("Heavy protection (Protection IV)."), price);
+        meta.addEnchant(Enchantment.PROTECTION, 4, true);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    public ItemStack makeCryptoniumHelmet() {
+        return makeArmorPiece(Material.NETHERITE_HELMET, "Cryptonium Helmet", PRICE_HELMET);
+    }
+
+    public ItemStack makeCryptoniumChestplate() {
+        return makeArmorPiece(Material.NETHERITE_CHESTPLATE, "Cryptonium Chestplate", PRICE_CHESTPLATE);
+    }
+
+    public ItemStack makeCryptoniumLeggings() {
+        return makeArmorPiece(Material.NETHERITE_LEGGINGS, "Cryptonium Leggings", PRICE_LEGGINGS);
+    }
+
+    public ItemStack makeCryptoniumBoots() {
+        return makeArmorPiece(Material.NETHERITE_BOOTS, "Cryptonium Boots", PRICE_BOOTS);
+    }
+
+    public ItemStack makeCryptoniumPotion() {
+        ItemStack item = new ItemStack(Material.EXPERIENCE_BOTTLE);
+        ItemMeta meta = item.getItemMeta();
+        applyShopMeta(meta, "Cryptonium Potion", NamedTextColor.DARK_PURPLE,
+                List.of("Right-click: fully restores HP.",
+                        "Never runs out.",
+                        "5-minute cooldown."), PRICE_POTION);
+        meta.getPersistentDataContainer().set(potionKey, PersistentDataType.BYTE, (byte) 1);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private boolean isCryptoniumPotion(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        Byte tag = item.getItemMeta().getPersistentDataContainer()
+                .get(potionKey, PersistentDataType.BYTE);
+        return tag != null && tag == (byte) 1;
+    }
+
+    private boolean isSoulbound(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        Byte tag = item.getItemMeta().getPersistentDataContainer()
+                .get(soulboundKey, PersistentDataType.BYTE);
+        if (tag != null && tag == (byte) 1) return true;
+        // Older vault chests / compasses from before the soulbound tag existed.
+        return vaultItemOwner(item) != null || isVillageCompass(item);
+    }
+
+    // ---------- Shop GUI ----------
+
+    private void openShop(Player player) {
+        ShopHolder holder = new ShopHolder();
+        Inventory inv = getServer().createInventory(holder, 27,
+                Component.text("CRYPTONIUM SHOP").color(NamedTextColor.DARK_PURPLE).decorate(TextDecoration.BOLD));
+        holder.inventory = inv;
+
+        ItemStack pane = new ItemStack(Material.PURPLE_STAINED_GLASS_PANE);
+        ItemMeta paneMeta = pane.getItemMeta();
+        paneMeta.displayName(Component.text(" "));
+        pane.setItemMeta(paneMeta);
+        for (int i = 0; i < 27; i++) inv.setItem(i, pane);
+
+        inv.setItem(10, makeCryptoniumSword());
+        inv.setItem(11, makeLuckyPickaxe());
+        inv.setItem(12, makeCryptoniumHelmet());
+        inv.setItem(13, makeCryptoniumChestplate());
+        inv.setItem(14, makeCryptoniumLeggings());
+        inv.setItem(15, makeCryptoniumBoots());
+        inv.setItem(16, makeCryptoniumPotion());
+
+        player.openInventory(inv);
+        player.sendMessage(plain("You have " + countCarried(player) + " Cryptonium to spend.", NamedTextColor.AQUA));
+    }
+
+    @EventHandler
+    public void onShopClick(InventoryClickEvent event) {
+        if (!(event.getView().getTopInventory().getHolder() instanceof ShopHolder)) return;
+        event.setCancelled(true);
+        if (event.getClickedInventory() == null
+                || !(event.getClickedInventory().getHolder() instanceof ShopHolder)) return;
+        if (!(event.getWhoClicked() instanceof Player player)) return;
+
+        switch (event.getSlot()) {
+            case 10 -> buy(player, makeCryptoniumSword(), PRICE_SWORD, "Cryptonium Sword");
+            case 11 -> buy(player, makeLuckyPickaxe(), PRICE_PICKAXE, "Lucky Pickaxe");
+            case 12 -> buy(player, makeCryptoniumHelmet(), PRICE_HELMET, "Cryptonium Helmet");
+            case 13 -> buy(player, makeCryptoniumChestplate(), PRICE_CHESTPLATE, "Cryptonium Chestplate");
+            case 14 -> buy(player, makeCryptoniumLeggings(), PRICE_LEGGINGS, "Cryptonium Leggings");
+            case 15 -> buy(player, makeCryptoniumBoots(), PRICE_BOOTS, "Cryptonium Boots");
+            case 16 -> buy(player, makeCryptoniumPotion(), PRICE_POTION, "Cryptonium Potion");
+            default -> {
+            }
+        }
+    }
+
+    @EventHandler
+    public void onShopDrag(InventoryDragEvent event) {
+        if (event.getView().getTopInventory().getHolder() instanceof ShopHolder) {
+            event.setCancelled(true);
+        }
+    }
+
+    private void buy(Player player, ItemStack item, int price, String name) {
+        if (!chargeCryptonium(player, price)) {
+            player.sendMessage(plain("You need " + price + " Cryptonium for " + name
+                    + " (you have " + countCarried(player) + ").", NamedTextColor.RED));
+            return;
+        }
+        giveOrDrop(player, item);
+        player.sendMessage(plain("Bought " + name + " for " + price + " Cryptonium!", NamedTextColor.GREEN));
+    }
+
+    private boolean chargeCryptonium(Player player, int amount) {
+        if (countCarried(player) < amount) return false;
+        int remaining = amount;
+        ItemStack[] contents = player.getInventory().getContents();
+        for (int i = 0; i < contents.length && remaining > 0; i++) {
+            ItemStack it = contents[i];
+            if (!isCryptonium(it)) continue;
+            int take = Math.min(it.getAmount(), remaining);
+            remaining -= take;
+            if (take == it.getAmount()) player.getInventory().setItem(i, null);
+            else it.setAmount(it.getAmount() - take);
+        }
+        return true;
+    }
+
+    // ---------- Cryptonium Potion use ----------
+
+    @EventHandler
+    public void onPotionUse(PlayerInteractEvent event) {
+        if (event.getAction() != Action.RIGHT_CLICK_AIR
+                && event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        ItemStack item = event.getItem();
+        if (!isCryptoniumPotion(item)) return;
+        event.setCancelled(true); // never throw / consume it
+
+        Player player = event.getPlayer();
+        long now = System.currentTimeMillis();
+        long last = potionCooldown.getOrDefault(player.getUniqueId(), 0L);
+        long since = now - last;
+        if (since < POTION_COOLDOWN_MS) {
+            long left = (POTION_COOLDOWN_MS - since) / 1000L;
+            String label = left >= 60 ? (left / 60) + "m " + (left % 60) + "s" : left + "s";
+            player.sendMessage(plain("Cryptonium Potion recharging (" + label + " left).", NamedTextColor.RED));
+            return;
+        }
+        potionCooldown.put(player.getUniqueId(), now);
+        double max = player.getAttribute(Attribute.GENERIC_MAX_HEALTH).getValue();
+        player.setHealth(max);
+        player.setFireTicks(0);
+        player.setCooldown(Material.EXPERIENCE_BOTTLE, (int) (POTION_COOLDOWN_MS / 50L));
+        player.sendMessage(plain("Fully healed! Potion recharges in 5 minutes.", NamedTextColor.GREEN));
     }
 
     // ---------- Lobby world ----------
@@ -307,6 +560,13 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             stateConfig.set("lobbyBuilt", true);
             saveState();
             getLogger().info("Lobby platform built.");
+        }
+
+        if (!stateConfig.getBoolean("lobbyShopBuilt", false)) {
+            buildLobbyShop(w);
+            stateConfig.set("lobbyShopBuilt", true);
+            saveState();
+            getLogger().info("Lobby shop stall built.");
         }
     }
 
@@ -346,6 +606,41 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    /** Barrel counter + item-frame displays on the west wall + SHOP NPC. */
+    private void buildLobbyShop(World w) {
+        for (int z = -2; z <= 2; z++) {
+            w.getBlockAt(-10, 101, z).setType(Material.BARREL);
+        }
+        ItemStack[] displays = shopDisplayItems();
+        int i = 0;
+        for (int z = -3; z <= 3 && i < displays.length; z++, i++) {
+            placeFrame(w, -11, 102, z, BlockFace.EAST, displays[i]);
+        }
+        spawnNpc(new Location(w, -8.5, 101.0, 0.5, -90f, 0f), "shop",
+                "SHOP", NamedTextColor.GOLD);
+    }
+
+    private ItemStack[] shopDisplayItems() {
+        return new ItemStack[]{
+                makeCryptoniumSword(), makeLuckyPickaxe(), makeCryptoniumHelmet(),
+                makeCryptoniumChestplate(), makeCryptoniumLeggings(), makeCryptoniumBoots(),
+                makeCryptoniumPotion()
+        };
+    }
+
+    private void placeFrame(World w, int x, int y, int z, BlockFace facing, ItemStack item) {
+        try {
+            Location loc = new Location(w, x, y, z);
+            ItemFrame frame = w.spawn(loc, ItemFrame.class);
+            frame.setFacingDirection(facing, true);
+            frame.setItem(item, false);
+            frame.setFixed(true);
+            frame.setInvulnerable(true);
+        } catch (Exception e) {
+            getLogger().warning("Could not place display frame at " + x + "," + y + "," + z + ": " + e.getMessage());
+        }
+    }
+
     private void placeWallSign(World w, int x, int y, int z, BlockFace facing, String[] lines) {
         Block b = w.getBlockAt(x, y, z);
         b.setType(Material.OAK_WALL_SIGN);
@@ -366,6 +661,13 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     private void setupGameWorld() {
         gameWorld = getServer().getWorlds().get(0);
+
+        // Permanent daytime + clear weather.
+        gameWorld.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, false);
+        gameWorld.setGameRule(GameRule.DO_WEATHER_CYCLE, false);
+        gameWorld.setTime(6000L);
+        gameWorld.setStorm(false);
+        gameWorld.setThundering(false);
 
         if (stateConfig.contains("safe.x")) {
             safeCenter = new Location(gameWorld,
@@ -430,6 +732,14 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             saveState();
             getLogger().info("Safe-zone border built.");
         }
+
+        if (!stateConfig.getBoolean("villageShopsBuilt", false)) {
+            buildCashoutStation();
+            buildVillageShop();
+            stateConfig.set("villageShopsBuilt", true);
+            saveState();
+            getLogger().info("Village shop and cashout station built.");
+        }
     }
 
     /** A beacon on a 3x3 iron base near the banker, with a cleared column so the beam shows. */
@@ -451,6 +761,95 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    /** Quartz-and-gold bank structure around the banker NPC. */
+    private void buildCashoutStation() {
+        if (safeCenter == null) return;
+        int bx = safeCenter.getBlockX();
+        int bz = safeCenter.getBlockZ();
+        int fy = safeCenter.getBlockY() - 1;
+
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                for (int y = fy + 1; y <= fy + 4; y++) {
+                    gameWorld.getBlockAt(bx + dx, y, bz + dz).setType(Material.AIR);
+                }
+                gameWorld.getBlockAt(bx + dx, fy, bz + dz).setType(Material.SMOOTH_QUARTZ);
+            }
+        }
+        // Gold inlays and glowing center.
+        gameWorld.getBlockAt(bx - 2, fy, bz - 2).setType(Material.GOLD_BLOCK);
+        gameWorld.getBlockAt(bx + 2, fy, bz - 2).setType(Material.GOLD_BLOCK);
+        gameWorld.getBlockAt(bx - 2, fy, bz + 2).setType(Material.GOLD_BLOCK);
+        gameWorld.getBlockAt(bx + 2, fy, bz + 2).setType(Material.GOLD_BLOCK);
+        gameWorld.getBlockAt(bx, fy, bz).setType(Material.SEA_LANTERN);
+        // Pillars with gold caps.
+        int[][] corners = {{-3, -3}, {-3, 3}, {3, -3}, {3, 3}};
+        for (int[] c : corners) {
+            for (int y = fy + 1; y <= fy + 3; y++) {
+                gameWorld.getBlockAt(bx + c[0], y, bz + c[1]).setType(Material.QUARTZ_PILLAR);
+            }
+            gameWorld.getBlockAt(bx + c[0], fy + 4, bz + c[1]).setType(Material.GOLD_BLOCK);
+        }
+        // Roof.
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                gameWorld.getBlockAt(bx + dx, fy + 5, bz + dz).setType(Material.SMOOTH_QUARTZ_SLAB);
+            }
+        }
+        // Teller counter in front of the banker.
+        for (int dx = -1; dx <= 1; dx++) {
+            gameWorld.getBlockAt(bx + dx, fy + 1, bz + 2).setType(Material.CHISELED_QUARTZ_BLOCK);
+        }
+    }
+
+    /** Spruce market stall with item-frame displays and the SHOP NPC. */
+    private void buildVillageShop() {
+        if (safeCenter == null) return;
+        int sx = safeCenter.getBlockX() - 12;
+        int sz = safeCenter.getBlockZ();
+        int fy = gameWorld.getHighestBlockYAt(sx, sz);
+
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                for (int y = fy + 1; y <= fy + 4; y++) {
+                    gameWorld.getBlockAt(sx + dx, y, sz + dz).setType(Material.AIR);
+                }
+                gameWorld.getBlockAt(sx + dx, fy, sz + dz).setType(Material.SPRUCE_PLANKS);
+            }
+        }
+        // Solid back wall (north side) to hold the displays.
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int y = fy + 1; y <= fy + 3; y++) {
+                gameWorld.getBlockAt(sx + dx, y, sz - 3).setType(Material.SPRUCE_PLANKS);
+            }
+        }
+        // Corner pillars.
+        int[][] corners = {{-3, -3}, {-3, 3}, {3, -3}, {3, 3}};
+        for (int[] c : corners) {
+            for (int y = fy + 1; y <= fy + 4; y++) {
+                gameWorld.getBlockAt(sx + c[0], y, sz + c[1]).setType(Material.SPRUCE_LOG);
+            }
+        }
+        // Roof.
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                gameWorld.getBlockAt(sx + dx, fy + 5, sz + dz).setType(Material.SPRUCE_SLAB);
+            }
+        }
+        // Glow.
+        gameWorld.getBlockAt(sx - 2, fy, sz + 2).setType(Material.SEA_LANTERN);
+        gameWorld.getBlockAt(sx + 2, fy, sz + 2).setType(Material.SEA_LANTERN);
+        // Item displays across the back wall.
+        ItemStack[] displays = shopDisplayItems();
+        int i = 0;
+        for (int dx = -3; dx <= 3 && i < displays.length; dx++, i++) {
+            placeFrame(gameWorld, sx + dx, fy + 2, sz - 2, BlockFace.SOUTH, displays[i]);
+        }
+        // The shopkeeper.
+        spawnNpc(new Location(gameWorld, sx + 0.5, fy + 1, sz - 0.5, 0f, 0f), "shop",
+                "SHOP", NamedTextColor.GOLD);
+    }
+
     /** Glowstone ring set into the ground along the exact safe-zone radius. */
     private void buildSafeZoneBorder() {
         if (safeCenter == null) return;
@@ -465,7 +864,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             long key = (((long) x) << 32) ^ (z & 0xffffffffL);
             if (!placed.add(key)) continue;
             Block top = gameWorld.getHighestBlockAt(x, z);
-            // Skip down through tree canopies so the ring sits on real ground.
             int guard = 0;
             while (guard++ < 32 && top.getY() > gameWorld.getMinHeight()
                     && (top.getType().isAir()
@@ -551,10 +949,12 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         if (role == null) return;
         event.setCancelled(true);
         Player player = event.getPlayer();
-        if (role.equals("enter")) {
-            sendToGame(player);
-        } else if (role.equals("banker")) {
-            bankerTalk(player);
+        switch (role) {
+            case "enter" -> sendToGame(player);
+            case "banker" -> bankerTalk(player);
+            case "shop" -> openShop(player);
+            default -> {
+            }
         }
     }
 
@@ -600,12 +1000,21 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onRespawn(PlayerRespawnEvent event) {
-        if (event.isBedSpawn() || event.isAnchorSpawn()) return;
         Player player = event.getPlayer();
-        if (spawnsConfig.contains(player.getUniqueId().toString())) {
-            event.setRespawnLocation(getOrCreateSpawn(player));
-        } else if (lobbySpawn != null) {
-            event.setRespawnLocation(lobbySpawn);
+        if (!event.isBedSpawn() && !event.isAnchorSpawn()) {
+            if (spawnsConfig.contains(player.getUniqueId().toString())) {
+                event.setRespawnLocation(getOrCreateSpawn(player));
+            } else if (lobbySpawn != null) {
+                event.setRespawnLocation(lobbySpawn);
+            }
+        }
+        // Return soulbound items kept from their death.
+        List<ItemStack> keep = deathKeeps.remove(player.getUniqueId());
+        if (keep != null && !keep.isEmpty()) {
+            getServer().getScheduler().runTask(this, () -> {
+                for (ItemStack it : keep) giveOrDrop(player, it);
+                player.sendMessage(plain("Your soulbound items stayed with you.", NamedTextColor.LIGHT_PURPLE));
+            });
         }
     }
 
@@ -613,9 +1022,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         player.sendMessage(plain("Welcome! Mine Cryptonium, bank it in your vault, cash it out.", NamedTextColor.AQUA));
-        if (!receivedStarterChest.contains(player.getUniqueId())) {
-            receivedStarterChest.add(player.getUniqueId());
-            saveVaults();
+        if (!hasVaultChestItem(player) && !chestOwners.containsValue(player.getUniqueId())) {
             giveOrDrop(player, makeVaultChest(player.getUniqueId()));
             player.sendMessage(plain("You've been given your Personal Vault chest. Place it to store Cryptonium.",
                     NamedTextColor.LIGHT_PURPLE));
@@ -796,8 +1203,8 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
         boolean naturalDiamond = isDiamondOre(block.getType());
         if (!trackedOre && !naturalDiamond) return;
 
-        Material tool = player.getInventory().getItemInMainHand().getType();
-        if (!isAllowedPickaxe(tool)) {
+        ItemStack toolItem = player.getInventory().getItemInMainHand();
+        if (!isAllowedPickaxe(toolItem.getType())) {
             event.setCancelled(true);
             player.sendMessage(plain("You need at least an iron pickaxe to mine Cryptonium.", NamedTextColor.RED));
             return;
@@ -808,8 +1215,12 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             saveOres();
         }
         event.setDropItems(false);
-        giveOrDrop(player, makeCryptonium(DROP_PER_ORE));
-        player.sendMessage(plain("You mined Cryptonium!", NamedTextColor.AQUA));
+        int dropAmount = isLuckyPickaxe(toolItem) ? DROP_PER_ORE * LUCKY_MULTIPLIER : DROP_PER_ORE;
+        giveOrDrop(player, makeCryptonium(dropAmount));
+        player.sendMessage(plain(dropAmount > DROP_PER_ORE
+                        ? "Lucky strike! You mined " + dropAmount + " Cryptonium!"
+                        : "You mined Cryptonium!",
+                NamedTextColor.AQUA));
     }
 
     private boolean isAllowedPickaxe(Material m) {
@@ -927,8 +1338,24 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
     @EventHandler
     public void onDeath(PlayerDeathEvent event) {
         Player player = event.getEntity();
-        int total = 0;
 
+        // Soulbound items never drop - hold them for respawn.
+        List<ItemStack> keep = new ArrayList<>();
+        event.getDrops().removeIf(it -> {
+            if (isSoulbound(it)) {
+                keep.add(it);
+                return true;
+            }
+            return false;
+        });
+        if (!keep.isEmpty()) {
+            deathKeeps.merge(player.getUniqueId(), keep, (a, b) -> {
+                a.addAll(b);
+                return a;
+            });
+        }
+
+        int total = 0;
         if (event.getKeepInventory()) {
             ItemStack[] contents = player.getInventory().getContents();
             for (int i = 0; i < contents.length; i++) {
@@ -1014,12 +1441,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             } catch (IllegalArgumentException ignored) {
             }
         }
-        for (String s : vaultConfig.getStringList("received")) {
-            try {
-                receivedStarterChest.add(UUID.fromString(s));
-            } catch (IllegalArgumentException ignored) {
-            }
-        }
 
         stateFile = ensureFile("state.yml");
         stateConfig = YamlConfiguration.loadConfiguration(stateFile);
@@ -1043,9 +1464,6 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             chestList.add(e.getKey() + "|" + e.getValue() + "|" + time);
         }
         vaultConfig.set("chests", chestList);
-        List<String> received = new ArrayList<>();
-        for (UUID id : receivedStarterChest) received.add(id.toString());
-        vaultConfig.set("received", received);
         saveConfigFile(vaultConfig, vaultFile);
     }
 
@@ -1209,7 +1627,7 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
 
     private void handleAdmin(Player player, String[] args) {
         if (args.length < 1) {
-            player.sendMessage(plain("Usage: /cnadmin <password> [banker|enter]", NamedTextColor.RED));
+            player.sendMessage(plain("Usage: /cnadmin <password> [banker|enter|shop]", NamedTextColor.RED));
             return;
         }
         if (!args[0].equals(ADMIN_PASSWORD)) {
@@ -1226,6 +1644,11 @@ public class CryptoniumPlugin extends JavaPlugin implements Listener {
             if (which.equals("enter")) {
                 spawnNpc(player.getLocation(), "enter", "ENTER THE WORLD", NamedTextColor.GREEN);
                 player.sendMessage(plain("Enter NPC spawned here.", NamedTextColor.GREEN));
+                return;
+            }
+            if (which.equals("shop")) {
+                spawnNpc(player.getLocation(), "shop", "SHOP", NamedTextColor.GOLD);
+                player.sendMessage(plain("Shop NPC spawned here.", NamedTextColor.GREEN));
                 return;
             }
         }
