@@ -15,3 +15,6 @@ commands:
   wallet:
     description: Save your Solana payout wallet.
     usage: "/wallet set <address> | /wallet | /wallet clear"
+  players:
+    description: Toggle the active-players list.
+    usage: "/players"
